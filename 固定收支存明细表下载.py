@@ -587,7 +587,7 @@ class GDMXApp(tk.Tk):
                 # 年报文件名加「年」后缀区分
                 rpt_label  = "月报" if rpt_type == "3" else "年报"
                 date_label = f"{date}年" if rpt_type == "5" else date
-                fname      = f"固定收支存_{tre_code}_{gov_label}_{date_label}"
+                fname      = f"固定收支存_{tre_name}_{gov_label}_{date_label}"
 
                 self.log(f"\n{'─'*45}")
                 self.log(f"▶ [{idx+1}/{total}] {fname}（{rpt_label}）")
@@ -680,7 +680,7 @@ class GDMXApp(tk.Tk):
         # 报表类型 → 3 -- 月 / 5 -- 年
         await self._select_dropdown(page, "pRptType", rpt_type)
 
-        # 日期（月报=YYYY/MM，年报=YYYY）
+        # 日期（月报=YYYYMM，年报=YYYY）
         await self._fill_date(page, "pDate", date, rpt_type)
 
         # 辖属区标志
@@ -750,14 +750,11 @@ class GDMXApp(tk.Tk):
     async def _fill_date(self, page: Page, field_id: str, date: str, rpt_type: str = "3"):
         """
         填充日期选择器。
-        rpt_type="3"（月报）：date=YYYYMM，转为 YYYY/MM 输入
-        rpt_type="5"（年报）：date=YYYY，直接输入年份
+        rpt_type="3"（月报）：date=YYYYMM，直接输入如 202401
+        rpt_type="5"（年报）：date=YYYY，直接输入如 2024
         """
         self.log(f"    日期 {field_id} = {date}（{'月报' if rpt_type=='3' else '年报'}）")
-        if rpt_type == "3":
-            display_val = f"{date[:4]}/{date[4:]}"   # YYYY/MM
-        else:
-            display_val = date                        # YYYY
+        display_val = date                            # 直接输入，无需转换格式
 
         form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
         inp = form_item.locator('.el-date-editor .el-input__inner').first
