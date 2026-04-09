@@ -504,7 +504,7 @@ class GDMXApp(tk.Tk):
             for tre_code, tre_name, gov_opts in treasuries:
                 for gov_code, gov_label in gov_opts:
                     tasks.append({
-                        "rpt_type": "月",
+                        "rpt_type": "3",          # 3 -- 月
                         "date":     month,        # YYYYMM
                         "tre_code": tre_code,
                         "tre_name": tre_name,
@@ -516,7 +516,7 @@ class GDMXApp(tk.Tk):
             for tre_code, tre_name, gov_opts in treasuries:
                 for gov_code, gov_label in gov_opts:
                     tasks.append({
-                        "rpt_type": "年",
+                        "rpt_type": "5",          # 5 -- 年
                         "date":     year,         # YYYY
                         "tre_code": tre_code,
                         "tre_name": tre_name,
@@ -585,11 +585,12 @@ class GDMXApp(tk.Tk):
                 gov_code  = task["gov_code"]
                 gov_label = task["gov_label"]
                 # 年报文件名加「年」后缀区分
-                date_label = f"{date}年" if rpt_type == "年" else date
+                rpt_label  = "月报" if rpt_type == "3" else "年报"
+                date_label = f"{date}年" if rpt_type == "5" else date
                 fname      = f"固定收支存_{tre_code}_{gov_label}_{date_label}"
 
                 self.log(f"\n{'─'*45}")
-                self.log(f"▶ [{idx+1}/{total}] {fname}（{rpt_type}报）")
+                self.log(f"▶ [{idx+1}/{total}] {fname}（{rpt_label}）")
                 self.log(f"{'─'*45}")
 
                 try:
@@ -664,21 +665,22 @@ class GDMXApp(tk.Tk):
     # 表单填充
     # ================================================================
     async def _fill_form(self, page: Page, date: str, tre_code: str,
-                         gov_code: str, rpt_type: str = "月"):
+                         gov_code: str, rpt_type: str = "3"):
         """
         填写表单字段。
-        rpt_type="月"：date 为 YYYYMM，报表类型选「月」
-        rpt_type="年"：date 为 YYYY，  报表类型选「年」
+        rpt_type="3"（3 -- 月）：date 为 YYYYMM
+        rpt_type="5"（5 -- 年）：date 为 YYYY
         """
-        self.log(f"  填充表单（{rpt_type}报，日期={date}）...")
+        rpt_label = "月报" if rpt_type == "3" else "年报"
+        self.log(f"  填充表单（{rpt_label}，日期={date}）...")
 
-        # 金额单位 → 元
+        # 金额单位 → 0 -- 元
         await self._select_dropdown(page, "pAmtUnit", "0")
 
-        # 报表类型 → 月 / 年
+        # 报表类型 → 3 -- 月 / 5 -- 年
         await self._select_dropdown(page, "pRptType", rpt_type)
 
-        # 日期
+        # 日期（月报=YYYY/MM，年报=YYYY）
         await self._fill_date(page, "pDate", date, rpt_type)
 
         # 辖属区标志
@@ -745,14 +747,14 @@ class GDMXApp(tk.Tk):
 
         await asyncio.sleep(0.3)
 
-    async def _fill_date(self, page: Page, field_id: str, date: str, rpt_type: str = "月"):
+    async def _fill_date(self, page: Page, field_id: str, date: str, rpt_type: str = "3"):
         """
         填充日期选择器。
-        月报（rpt_type="月"）：date=YYYYMM，转为 YYYY/MM 输入
-        年报（rpt_type="年"）：date=YYYY，直接输入年份
+        rpt_type="3"（月报）：date=YYYYMM，转为 YYYY/MM 输入
+        rpt_type="5"（年报）：date=YYYY，直接输入年份
         """
-        self.log(f"    日期 {field_id} = {date}（{rpt_type}）")
-        if rpt_type == "月":
+        self.log(f"    日期 {field_id} = {date}（{'月报' if rpt_type=='3' else '年报'}）")
+        if rpt_type == "3":
             display_val = f"{date[:4]}/{date[4:]}"   # YYYY/MM
         else:
             display_val = date                        # YYYY
