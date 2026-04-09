@@ -45,11 +45,11 @@ except ImportError:
 IFRAME_NAME  = "fineReportTsasRpt1010"
 MENU_PATH    = ["固定报表", "国库收支存明细表"]
 
-# 辖属标志选项：(下拉选项前缀, 文件名后缀)
-GOVERN_OPTIONS = [
-    ("0", "全辖"),
-    ("1", "本级"),
-]
+# 辖属标志映射：列名 → (下拉选项前缀, 文件名后缀)
+GOVERN_MAP = {
+    "下载全辖": ("0", "全辖"),
+    "下载本级": ("1", "本级"),
+}
 
 # 全局停止标志
 stop_flag    = False
@@ -112,16 +112,19 @@ class GDMXApp(tk.Tk):
         self.configure(bg=self.BG_PRIMARY)
         self.minsize(800, 650)
 
-        self.excel_path       = tk.StringVar()
-        self.download_folder  = tk.StringVar()
-        self.start_month_var  = tk.StringVar(value="202401")
-        self.end_month_var    = tk.StringVar(value="202512")
-        self.chrome_path_var  = tk.StringVar()
-        self.target_url       = None
-        self.is_running       = False
-        self.worker_thread    = None
-        self.sniper_thread    = None
-        self.current_nav_done = False   # 是否已导航到目标菜单
+        self.excel_path        = tk.StringVar()
+        self.download_folder   = tk.StringVar()
+        self.start_month_var   = tk.StringVar(value="202401")
+        self.end_month_var     = tk.StringVar(value="202512")
+        self.start_year_var    = tk.StringVar(value="2024")
+        self.end_year_var      = tk.StringVar(value="2025")
+        self.enable_year_var   = tk.BooleanVar(value=True)
+        self.chrome_path_var   = tk.StringVar()
+        self.target_url        = None
+        self.is_running        = False
+        self.worker_thread     = None
+        self.sniper_thread     = None
+        self.current_nav_done  = False
 
         self._init_styles()
         self._build_gui()
@@ -170,7 +173,7 @@ class GDMXApp(tk.Tk):
         hdr = ttk.Frame(c, style="Main.TFrame")
         hdr.pack(fill=tk.X, pady=(0, 12))
         ttk.Label(hdr, text="国库收支存明细表  批量下载", style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(hdr, text="固定报表 · 自动导出 · 全辖/本级 × 14库 × 月份",
+        ttk.Label(hdr, text="固定报表 · 月报+年报 · 全辖/本级按国库配置",
                   style="Sub.TLabel").pack(side=tk.LEFT, padx=(14, 0), pady=(8, 0))
 
         # 文件卡片
@@ -180,20 +183,40 @@ class GDMXApp(tk.Tk):
         self._file_row(card, "国库列表文件", self.excel_path, self._select_excel, row_pady=(0, 10))
         self._file_row(card, "保存目录    ", self.download_folder, self._select_folder)
 
-        # 月份行
+        # 月报行
         row3 = ttk.Frame(card, style="Card.TFrame")
         row3.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(row3, text="起始月份", style="Card.TLabel", width=10).pack(side=tk.LEFT)
+        ttk.Label(row3, text="月报起始", style="Card.TLabel", width=10).pack(side=tk.LEFT)
         tk.Entry(row3, textvariable=self.start_month_var,
                  bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
                  font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0, width=12
                  ).pack(side=tk.LEFT, padx=(8, 20))
-        ttk.Label(row3, text="终止月份", style="Card.TLabel", width=10).pack(side=tk.LEFT)
+        ttk.Label(row3, text="月报终止", style="Card.TLabel", width=10).pack(side=tk.LEFT)
         tk.Entry(row3, textvariable=self.end_month_var,
                  bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
                  font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0, width=12
                  ).pack(side=tk.LEFT, padx=(8, 10))
         ttk.Label(row3, text="格式 YYYYMM，如 202401", style="Card.TLabel").pack(side=tk.LEFT, padx=(10, 0))
+
+        # 年报行
+        row_yr = ttk.Frame(card, style="Card.TFrame")
+        row_yr.pack(fill=tk.X, pady=(8, 0))
+        tk.Checkbutton(row_yr, text="下载年报", variable=self.enable_year_var,
+                       bg=self.BG_CARD, fg=self.FG_PRIMARY, selectcolor=self.BG_INPUT,
+                       activebackground=self.BG_CARD, activeforeground=self.FG_PRIMARY,
+                       font=("Segoe UI", 10), bd=0, highlightthickness=0
+                       ).pack(side=tk.LEFT)
+        ttk.Label(row_yr, text="起始年", style="Card.TLabel", width=6).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Entry(row_yr, textvariable=self.start_year_var,
+                 bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
+                 font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0, width=8
+                 ).pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row_yr, text="终止年", style="Card.TLabel", width=6).pack(side=tk.LEFT)
+        tk.Entry(row_yr, textvariable=self.end_year_var,
+                 bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
+                 font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0, width=8
+                 ).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(row_yr, text="格式 YYYY，报表类型=年", style="Card.TLabel").pack(side=tk.LEFT, padx=(10, 0))
 
         # Chrome 行
         row4 = ttk.Frame(card, style="Card.TFrame")
@@ -419,18 +442,33 @@ class GDMXApp(tk.Tk):
     async def _run_automation(self, excel_file: str, dl_folder: str):
         global stop_flag
 
-        # 1. 读取国库列表
+        # 1. 读取国库列表（含辖属配置）
         self.log("读取国库列表...")
         try:
             df = pd.read_excel(excel_file, dtype=str).fillna("")
-            # 自动识别列名（兼容中英文）
             code_col = next((c for c in df.columns
                              if "代码" in c or "code" in c.lower()), df.columns[0])
             name_col = next((c for c in df.columns
-                             if "名称" in c or "name" in c.lower()), df.columns[1] if len(df.columns) > 1 else df.columns[0])
-            treasuries = [(str(row[code_col]).strip(), str(row[name_col]).strip())
-                          for _, row in df.iterrows()
-                          if str(row[code_col]).strip()]
+                             if "名称" in c or "name" in c.lower()),
+                            df.columns[1] if len(df.columns) > 1 else df.columns[0])
+            # 每行读取：国库代码、名称、辖属选项列表
+            treasuries = []
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip()
+                if not code:
+                    continue
+                name = str(row[name_col]).strip()
+                # 读取「下载全辖」「下载本级」列，默认全辖+本级都下
+                gov_opts = []
+                for col_name, (gov_code, gov_label) in GOVERN_MAP.items():
+                    if col_name in df.columns:
+                        val = str(row[col_name]).strip().upper()
+                        if val in ("是", "Y", "YES", "TRUE", "1", "√", "✓"):
+                            gov_opts.append((gov_code, gov_label))
+                    # 若列不存在，默认下载全辖+本级
+                if not gov_opts:
+                    gov_opts = [("0", "全辖"), ("1", "本级")]
+                treasuries.append((code, name, gov_opts))
         except Exception as e:
             self.log(f"读取Excel失败: {e}", "ERROR")
             return
@@ -446,22 +484,50 @@ class GDMXApp(tk.Tk):
         except Exception as e:
             self.log(f"月份解析失败: {e}", "ERROR")
             return
-        self.log(f"月份范围: {months[0]} ~ {months[-1]}，共 {len(months)} 个月")
+        self.log(f"月报范围: {months[0]} ~ {months[-1]}，共 {len(months)} 个月")
 
-        # 3. 构建任务列表：月份 × 国库 × 辖属
+        # 3. 生成年份列表
+        years = []
+        if self.enable_year_var.get():
+            try:
+                sy = int(self.start_year_var.get().strip())
+                ey = int(self.end_year_var.get().strip())
+                years = [str(y) for y in range(sy, ey + 1)]
+                self.log(f"年报范围: {years[0]} ~ {years[-1]}，共 {len(years)} 年")
+            except Exception as e:
+                self.log(f"年份解析失败: {e}，跳过年报", "WARN")
+
+        # 4. 构建任务列表：月报 + 年报
         tasks = []
+        # 月报：月份 × 国库 × 辖属
         for month in months:
-            for tre_code, tre_name in treasuries:
-                for gov_code, gov_label in GOVERN_OPTIONS:
+            for tre_code, tre_name, gov_opts in treasuries:
+                for gov_code, gov_label in gov_opts:
                     tasks.append({
-                        "month": month,
+                        "rpt_type": "月",
+                        "date":     month,        # YYYYMM
                         "tre_code": tre_code,
                         "tre_name": tre_name,
                         "gov_code": gov_code,
                         "gov_label": gov_label,
                     })
+        # 年报：年份 × 国库 × 辖属
+        for year in years:
+            for tre_code, tre_name, gov_opts in treasuries:
+                for gov_code, gov_label in gov_opts:
+                    tasks.append({
+                        "rpt_type": "年",
+                        "date":     year,         # YYYY
+                        "tre_code": tre_code,
+                        "tre_name": tre_name,
+                        "gov_code": gov_code,
+                        "gov_label": gov_label,
+                    })
+
         total = len(tasks)
-        self.log(f"共生成 {total} 个任务 ({len(months)}月 × {len(treasuries)}库 × {len(GOVERN_OPTIONS)}辖属)", "SUCCESS")
+        month_cnt = len(months) * sum(len(t[2]) for t in treasuries)
+        year_cnt  = len(years)  * sum(len(t[2]) for t in treasuries)
+        self.log(f"共生成 {total} 个任务（月报 {month_cnt} + 年报 {year_cnt}）", "SUCCESS")
 
         # 4. 启动浏览器
         self.log("启动 Chrome 浏览器...")
@@ -512,15 +578,18 @@ class GDMXApp(tk.Tk):
                     self.log("已停止", "WARN")
                     break
 
-                month    = task["month"]
-                tre_code = task["tre_code"]
-                tre_name = task["tre_name"]
-                gov_code = task["gov_code"]
+                rpt_type  = task["rpt_type"]
+                date      = task["date"]
+                tre_code  = task["tre_code"]
+                tre_name  = task["tre_name"]
+                gov_code  = task["gov_code"]
                 gov_label = task["gov_label"]
-                fname    = f"固定收支存_{tre_code}_{gov_label}_{month}"
+                # 年报文件名加「年」后缀区分
+                date_label = f"{date}年" if rpt_type == "年" else date
+                fname      = f"固定收支存_{tre_code}_{gov_label}_{date_label}"
 
                 self.log(f"\n{'─'*45}")
-                self.log(f"▶ [{idx+1}/{total}] {fname}")
+                self.log(f"▶ [{idx+1}/{total}] {fname}（{rpt_type}报）")
                 self.log(f"{'─'*45}")
 
                 try:
@@ -532,7 +601,7 @@ class GDMXApp(tk.Tk):
                         self.log("  复用已打开的报表页面", "INFO")
 
                     await asyncio.sleep(1.5)
-                    await self._fill_form(page, month, tre_code, gov_code)
+                    await self._fill_form(page, date, tre_code, gov_code, rpt_type)
                     await self._click_query_and_wait(page)
                     saved_path = await self._export_and_save(page, dl_folder, fname)
 
@@ -594,23 +663,28 @@ class GDMXApp(tk.Tk):
     # ================================================================
     # 表单填充
     # ================================================================
-    async def _fill_form(self, page: Page, month: str, tre_code: str, gov_code: str):
-        """填写5个字段：金额单位、报表类型、日期、辖属区标志、国库选择"""
-        self.log("  填充表单...")
+    async def _fill_form(self, page: Page, date: str, tre_code: str,
+                         gov_code: str, rpt_type: str = "月"):
+        """
+        填写表单字段。
+        rpt_type="月"：date 为 YYYYMM，报表类型选「月」
+        rpt_type="年"：date 为 YYYY，  报表类型选「年」
+        """
+        self.log(f"  填充表单（{rpt_type}报，日期={date}）...")
 
-        # 金额单位 → 元（选项值前缀 "0"）
+        # 金额单位 → 元
         await self._select_dropdown(page, "pAmtUnit", "0")
 
-        # 报表类型 → 月
-        await self._select_dropdown(page, "pRptType", "月")
+        # 报表类型 → 月 / 年
+        await self._select_dropdown(page, "pRptType", rpt_type)
 
-        # 日期（月份选择器）
-        await self._fill_month_picker(page, "pDate", month)
+        # 日期
+        await self._fill_date(page, "pDate", date, rpt_type)
 
         # 辖属区标志
         await self._select_dropdown(page, "pGovernFlag", gov_code)
 
-        # 国库选择（文本输入）
+        # 国库选择
         await self._fill_treasury(page, "pTreCode", tre_code)
 
         self.log("  表单填充完成", "SUCCESS")
@@ -671,27 +745,33 @@ class GDMXApp(tk.Tk):
 
         await asyncio.sleep(0.3)
 
-    async def _fill_month_picker(self, page: Page, field_id: str, yyyymm: str):
-        """填充 el-date-editor--month 月份选择器"""
-        self.log(f"    日期 {field_id} = {yyyymm}")
-        # YYYYMM → YYYY/MM 格式供选择器识别
-        display_val = f"{yyyymm[:4]}/{yyyymm[4:]}"
+    async def _fill_date(self, page: Page, field_id: str, date: str, rpt_type: str = "月"):
+        """
+        填充日期选择器。
+        月报（rpt_type="月"）：date=YYYYMM，转为 YYYY/MM 输入
+        年报（rpt_type="年"）：date=YYYY，直接输入年份
+        """
+        self.log(f"    日期 {field_id} = {date}（{rpt_type}）")
+        if rpt_type == "月":
+            display_val = f"{date[:4]}/{date[4:]}"   # YYYY/MM
+        else:
+            display_val = date                        # YYYY
 
         form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
         inp = form_item.locator('.el-date-editor .el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
-        await inp.triple_click()          # 全选已有内容
+        await inp.triple_click()
         await asyncio.sleep(0.2)
-        await inp.fill("")                # 清空，避免残留字符
+        await inp.fill("")
         await asyncio.sleep(0.1)
         await inp.type(display_val, delay=60)
         await asyncio.sleep(0.4)
         await inp.press("Enter")
         await asyncio.sleep(0.5)
-        # 若日历弹出层仍然可见，按 Escape 关闭
+        # 关闭可能残留的日历弹层
         try:
-            picker = page.locator(".el-month-table, .el-picker-panel")
+            picker = page.locator(".el-month-table, .el-year-table, .el-picker-panel")
             if await picker.first.is_visible(timeout=500):
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.2)
