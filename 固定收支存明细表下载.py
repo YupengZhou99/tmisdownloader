@@ -517,7 +517,7 @@ class GDMXApp(tk.Tk):
                 tre_name = task["tre_name"]
                 gov_code = task["gov_code"]
                 gov_label = task["gov_label"]
-                fname    = f"{month}_{tre_name}_{gov_label}"
+                fname    = f"固定收支存_{tre_code}_{gov_label}_{month}"
 
                 self.log(f"\n{'─'*45}")
                 self.log(f"▶ [{idx+1}/{total}] {fname}")
@@ -622,25 +622,46 @@ class GDMXApp(tk.Tk):
         inp = form_item.locator('.el-select .el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
         await inp.click()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.6)
 
         found = False
-        items = page.locator(".el-select-dropdown__item:visible")
+        # Element-UI 下拉弹出层在全局 body 下，需用 page.locator
+        # 等待下拉列表出现
+        try:
+            await page.wait_for_selector(
+                ".el-select-dropdown:not([style*='display: none']) .el-select-dropdown__item",
+                timeout=3000
+            )
+        except Exception:
+            pass
+
+        items = page.locator(
+            ".el-select-dropdown:not([style*='display: none']) .el-select-dropdown__item"
+        )
         count = await items.count()
         for i in range(count):
             item = items.nth(i)
             text = (await item.text_content() or "").strip()
-            if text == value or text.startswith(f"{value} ") or text.startswith(f"{value}--") or value in text:
+            # 匹配策略：完整相等、以"值 "开头（如"0 -- 元"）、值在文本中
+            if (text == value
+                    or text.startswith(f"{value} ")
+                    or text.startswith(f"{value}--")
+                    or f"-- {value}" in text
+                    or value in text):
                 await item.click()
                 found = True
                 break
 
         if not found:
+            # 回退：尝试 :has-text 选择器
             try:
-                await page.locator(
-                    f".el-select-dropdown__item:visible:has-text('{value}')"
-                ).first.click()
-                found = True
+                candidate = page.locator(
+                    f".el-select-dropdown:not([style*='display: none']) "
+                    f".el-select-dropdown__item:has-text('{value}')"
+                ).first
+                if await candidate.is_visible(timeout=1000):
+                    await candidate.click()
+                    found = True
             except Exception:
                 pass
 
@@ -651,44 +672,53 @@ class GDMXApp(tk.Tk):
         await asyncio.sleep(0.3)
 
     async def _fill_month_picker(self, page: Page, field_id: str, yyyymm: str):
-        """填充 el-date-editor--month 月份选择器（直接键入 YYYY-MM 格式）"""
+        """填充 el-date-editor--month 月份选择器"""
         self.log(f"    日期 {field_id} = {yyyymm}")
-        # 将 YYYYMM 转为 YYYY/MM 供选择器识别
+        # YYYYMM → YYYY/MM 格式供选择器识别
         display_val = f"{yyyymm[:4]}/{yyyymm[4:]}"
 
         form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
         inp = form_item.locator('.el-date-editor .el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
-        await inp.click()
-        await asyncio.sleep(0.3)
-        await inp.press("Control+a")
+        await inp.triple_click()          # 全选已有内容
+        await asyncio.sleep(0.2)
+        await inp.fill("")                # 清空，避免残留字符
         await asyncio.sleep(0.1)
-        await inp.press("Delete")
-        await asyncio.sleep(0.1)
-        await inp.type(display_val, delay=50)
-        await asyncio.sleep(0.3)
+        await inp.type(display_val, delay=60)
+        await asyncio.sleep(0.4)
         await inp.press("Enter")
         await asyncio.sleep(0.5)
+        # 若日历弹出层仍然可见，按 Escape 关闭
+        try:
+            picker = page.locator(".el-month-table, .el-picker-panel")
+            if await picker.first.is_visible(timeout=500):
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
+        except Exception:
+            pass
 
     async def _fill_treasury(self, page: Page, field_id: str, tre_code: str):
-        """在国库选择输入框中直接键入国库代码"""
+        """在国库选择输入框中直接键入国库代码，并触发 Vue 数据绑定"""
         self.log(f"    国库 {field_id} = {tre_code}")
         form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
-        inp = form_item.locator('.el-input .el-input__inner').first
+        inp = form_item.locator('.el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
-        await inp.click()
-        await asyncio.sleep(0.2)
-        await inp.press("Control+a")
-        await asyncio.sleep(0.1)
-        await inp.press("Delete")
+        await inp.triple_click()          # 全选已有内容
+        await asyncio.sleep(0.15)
+        await inp.fill("")                # 清空
         await asyncio.sleep(0.1)
         await inp.type(tre_code, delay=40)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
+        # 触发 input/change 事件让 Vue 更新数据绑定
+        await inp.dispatch_event("input")
+        await asyncio.sleep(0.1)
+        await inp.dispatch_event("change")
+        await asyncio.sleep(0.1)
         await inp.press("Enter")
-        await asyncio.sleep(0.5)
-        # Tab 触发 Vue 数据绑定
+        await asyncio.sleep(0.4)
+        # Tab 跳出字段，确保 blur 事件触发
         await inp.press("Tab")
         await asyncio.sleep(0.3)
 
@@ -696,7 +726,7 @@ class GDMXApp(tk.Tk):
     # 查询等待
     # ================================================================
     async def _click_query_and_wait(self, page: Page):
-        """点击查询，等待 iframe 内报表渲染完成（检测导出按钮 ui-state-enabled）"""
+        """点击查询，等待 iframe 内报表渲染完成"""
         self.log("  点击查询...")
         query_btn = page.locator("button.el-button:has-text('查询')").first
         await query_btn.wait_for(state="visible", timeout=5000)
@@ -706,35 +736,33 @@ class GDMXApp(tk.Tk):
         await asyncio.sleep(3)
 
         iframe = page.frame_locator(f'iframe[name="{IFRAME_NAME}"]')
-        # 用"导出"工具栏按钮的可用状态作为加载完成的信号
-        # FineReport 工具栏的导出按钮在报表加载完成后才会变为 enabled
+        # 以「导出」按钮（button.fr-btn-text.x-emb-export）的父级 .fr-btn 是否含
+        # ui-state-enabled 作为报表加载完成的信号
         max_wait, poll, elapsed = 360, 2, 0
         export_ready = False
         while elapsed < max_wait:
             try:
-                # 尝试检测帆软工具栏中已启用的导出类按钮
-                # 优先检测 ExcelO（原样），其次检测通用 Excel 按钮
-                for widget in ("ExcelO", "Excel", "export"):
-                    btn = iframe.locator(f'.fr-btn[widgetname="{widget}"]')
-                    try:
-                        cls = await btn.get_attribute("class", timeout=2000)
-                        if cls and "ui-state-enabled" in cls:
-                            export_ready = True
-                            break
-                    except Exception:
-                        pass
-                if export_ready:
-                    self.log("  报表加载完成", "SUCCESS")
-                    await asyncio.sleep(1)
-                    return
+                export_btn_parent = iframe.locator(
+                    '.fr-btn:has(button.x-emb-export)'
+                ).first
+                cls = await export_btn_parent.get_attribute("class", timeout=1500)
+                if cls and "ui-state-enabled" in cls:
+                    export_ready = True
             except Exception:
                 pass
+
+            if export_ready:
+                break
             await asyncio.sleep(poll)
             elapsed += poll
             if elapsed % 30 == 0:
                 self.log(f"  仍在等待... ({elapsed}s)", "INFO")
 
-        self.log("  等待超时，继续尝试导出...", "WARN")
+        if export_ready:
+            self.log("  报表加载完成", "SUCCESS")
+        else:
+            self.log("  等待超时，继续尝试导出...", "WARN")
+        await asyncio.sleep(1)
 
     # ================================================================
     # 导出：导出 → Excel → 原样导出
@@ -751,68 +779,54 @@ class GDMXApp(tk.Tk):
         iframe = page.frame_locator(f'iframe[name="{IFRAME_NAME}"]')
 
         async with page.expect_download(timeout=360000) as dl_info:
-            # ---- 步骤 1：点击「导出」按钮 ----
-            # 帆软工具栏「导出」按钮可能以文字或 widgetname 定位
-            export_btn = None
-            for selector in [
-                '.fr-btn[widgetname="ExcelO"]',          # 直接原样导出按钮（部分版本）
-                'button:has-text("导出")',
-                '.fr-toolbar-btn:has-text("导出")',
-                '[title="导出"]',
-                '.fr-btn:has-text("导出")',
-            ]:
-                try:
-                    candidate = iframe.locator(selector).first
-                    if await candidate.is_visible(timeout=2000):
-                        export_btn = candidate
-                        self.log(f"  找到导出按钮: {selector}")
-                        break
-                except Exception:
-                    pass
-
-            if export_btn is None:
-                # 最后尝试：直接找含 widgetname=ExcelO 并 force 点击
-                self.log("  未找到导出按钮，尝试 widgetname=ExcelO force 点击", "WARN")
-                export_btn = iframe.locator('.fr-btn[widgetname="ExcelO"]')
-
-            await export_btn.click(force=True)
+            # ----------------------------------------------------------------
+            # 步骤 1：点击工具栏「导出」按钮
+            # 实际 HTML：<div class="fr-btn ui-state-enabled">
+            #               <button class="fr-btn-text x-emb-export">导出</button>
+            #            </div>
+            # 注意：该 div 没有 widgetname 属性，用内部 button class 定位
+            # ----------------------------------------------------------------
+            export_btn = iframe.locator('button.fr-btn-text.x-emb-export').first
+            await export_btn.wait_for(state="visible", timeout=15000)
+            self.log("  点击导出按钮...")
+            await export_btn.click()
             await asyncio.sleep(0.8)
 
-            # ---- 步骤 2：点击「Excel」（若出现子菜单）----
-            # 若第一步直接触发了下载（即 widgetname=ExcelO 直接导出），
-            # expect_download 会在此处捕获，不再需要后续步骤。
-            # 若弹出菜单，则继续点击 Excel 和 原样导出。
-            try:
-                excel_item = page.locator(
-                    ".fr-menu-item:has-text('Excel'), "
-                    ".el-menu-item:has-text('Excel'), "
-                    "li:has-text('Excel'), "
-                    "a:has-text('Excel')"
-                ).first
-                if await excel_item.is_visible(timeout=2000):
-                    self.log("  点击 Excel 子菜单...")
-                    await excel_item.click()
-                    await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            # ----------------------------------------------------------------
+            # 步骤 2：点击一级菜单「Excel」
+            # 实际 HTML：<div class="fr-ui-core-menu menu">
+            #               <div class="menu-item"><div class="menu-text">Excel</div></div>
+            #            </div>
+            # 菜单在 iframe 内渲染，用 iframe.locator
+            # ----------------------------------------------------------------
+            excel_item = iframe.locator(
+                '.fr-ui-core-menu.menu .menu-item:has(.menu-text:text("Excel"))'
+            ).first
+            await excel_item.wait_for(state="visible", timeout=5000)
+            self.log("  点击 Excel 菜单项...")
+            await excel_item.hover()      # hover 触发子菜单展开
+            await asyncio.sleep(0.5)
 
-            # ---- 步骤 3：点击「原样导出」----
-            try:
-                raw_item = page.locator(
-                    ".fr-menu-item:has-text('原样导出'), "
-                    "li:has-text('原样导出'), "
-                    "a:has-text('原样导出')"
-                ).first
-                if await raw_item.is_visible(timeout=2000):
-                    self.log("  点击原样导出...")
-                    await raw_item.click(force=True)
-            except Exception:
-                pass
+            # ----------------------------------------------------------------
+            # 步骤 3：点击二级菜单「原样导出」
+            # 实际 HTML（初始 display:none，hover Excel 后显示）：
+            #   <div class="fr-ui-core-menu menu">
+            #     <div class="menu-item"><div class="menu-text">原样导出</div></div>
+            #   </div>
+            # ----------------------------------------------------------------
+            raw_item = iframe.locator(
+                '.fr-ui-core-menu.menu .menu-item:has(.menu-text:text("原样导出"))'
+            ).first
+            await raw_item.wait_for(state="visible", timeout=5000)
+            self.log("  点击原样导出...")
+            await raw_item.click()
 
         download = await dl_info.value
-        original_name = download.suggested_filename or "report.xlsx"
+        # 取原始文件扩展名（xlsx / xls），忽略系统生成的文件名主体
+        orig = download.suggested_filename or "report.xlsx"
+        ext = os.path.splitext(orig)[1] or ".xlsx"
         safe_fname = re.sub(r'[\\/:*?"<>|]', '', fname)
-        save_path = os.path.join(dl_folder, f"{safe_fname}_{original_name}")
+        save_path = os.path.join(dl_folder, f"{safe_fname}{ext}")
         await download.save_as(save_path)
         return save_path
 

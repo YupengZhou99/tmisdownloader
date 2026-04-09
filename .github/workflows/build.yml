@@ -70,11 +70,17 @@ jobs:
       - name: List dist directory
         run: dir dist
 
-      # ── 8. 上传 EXE 为 Artifact（保留 30 天）────────────────────
-      - name: Upload EXE artifacts
+      # ── 8. 复制模板文件到 dist ────────────────────────────────────
+      - name: Copy template to dist
+        run: copy "国库列表模板.xlsx" dist\
+
+      # ── 9. 上传 EXE + 模板为 Artifact（保留 30 天）──────────────
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: TMIS-Windows64-EXE
-          path: dist/*.exe
+          path: |
+            dist/*.exe
+            dist/*.xlsx
           retention-days: 30
           if-no-files-found: error
