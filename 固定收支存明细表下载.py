@@ -760,9 +760,11 @@ class GDMXApp(tk.Tk):
         inp = form_item.locator('.el-date-editor .el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
-        await inp.triple_click()
-        await asyncio.sleep(0.2)
-        await inp.fill("")
+        await inp.click()
+        await asyncio.sleep(0.3)
+        await inp.press("Control+a")
+        await asyncio.sleep(0.1)
+        await inp.press("Delete")
         await asyncio.sleep(0.1)
         await inp.type(display_val, delay=60)
         await asyncio.sleep(0.4)
@@ -784,9 +786,11 @@ class GDMXApp(tk.Tk):
         inp = form_item.locator('.el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
-        await inp.triple_click()          # 全选已有内容
-        await asyncio.sleep(0.15)
-        await inp.fill("")                # 清空
+        await inp.click()
+        await asyncio.sleep(0.3)
+        await inp.press("Control+a")       # 全选已有内容
+        await asyncio.sleep(0.1)
+        await inp.press("Delete")          # 清空
         await asyncio.sleep(0.1)
         await inp.type(tre_code, delay=40)
         await asyncio.sleep(0.3)
