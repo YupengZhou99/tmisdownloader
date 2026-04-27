@@ -12,8 +12,8 @@ Element-UI 组件的 `input` 元素通常没有唯一 ID，多个下拉框共享
 ### 解决方案：容器定位法（两步法）
 
 ```python
-# 第一步：通过 label[for] 锚定整个 form-item 容器
-form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
+# 第一步：通过 label[for] 锚定当前可见 form-item 容器
+form_item = page.locator(f'.el-form-item:visible:has(label[for="{field_id}"])').first
 
 # 第二步：在容器内精确查找目标控件
 dropdown = form_item.locator('.el-select .el-input__inner').first
@@ -22,9 +22,10 @@ text_inp = form_item.locator('.el-input .el-input__inner').first
 ```
 
 ### 核心原理
-- `.el-form-item:has(label[for="xxx"])` 利用 CSS `:has()` 伪类，选中**包含**指定 `label` 的整个表单项容器
+- `.el-form-item:visible:has(label[for="xxx"])` 利用 CSS `:has()` 伪类，选中**包含**指定 `label` 的当前可见表单项容器
 - 然后在容器内部用 `.el-select` / `.el-date-editor` 等二级选择器精确锁定目标
 - 这种方式比 `~`（兄弟选择器）更稳定，不受 DOM 层级变化影响
+- 在多标签页 SPA 中加 `:visible` 很关键，可避免隐藏旧标签页里的同名字段被 `.first` 命中
 
 ---
 
@@ -37,7 +38,7 @@ text_inp = form_item.locator('.el-input .el-input__inner').first
 
 ```python
 async def _close_current_tab(self, page, sz_type):
-    tab_name = f"总库{sz_type}数据自由查询"
+    tab_name = REPORT_CONFIGS[sz_type]["menu_title"]
     close_btn = page.locator(
         f"span.tags-view-item:has-text('{tab_name}')"
     ).locator(".el-icon-close").first
@@ -52,7 +53,7 @@ async def _close_current_tab(self, page, sz_type):
 |---|---|---|
 | 每次任务后关闭 | 绝对干净 | 浪费时间重复加载 |
 | 限定在活跃 Tab Pane 中查找 | 无需关闭 | 需要知道活跃容器的精确选择器 |
-| **仅在收支切换时关闭（推荐）** | 同类任务复用标签页（最快），异类任务自动清理 | 需维护导航状态标记 |
+| **仅在类型切换时关闭（推荐）** | 同类任务复用标签页（最快），异类任务自动清理 | 需维护导航状态标记 |
 
 ---
 
@@ -92,8 +93,8 @@ while not captured:
 ### 解决方案
 
 ```python
-# 1. 通过 iframe name 切入（收入6050，支出6060）
-iframe = page.frame_locator(f'iframe[name="fineReportTsasRpt6050"]')
+# 1. 通过 iframe name 切入（收入6010，支出6020，退库6030）
+iframe = page.frame_locator(f'iframe[name="{REPORT_CONFIGS[sz_type]["iframe_name"]}"]')
 
 # 2. 通过按钮 widgetname 属性检测查询完成状态
 export_btn = iframe.locator('.fr-btn[widgetname="ExcelO"]')
@@ -208,3 +209,50 @@ class TMISAutoApp(tk.Tk):
 - 后台线程中 `asyncio.run(_run_automation())` 运行异步代码
 - 所有 UI 更新通过 `self.after(0, callback)` 调度回主线程
 - `stop_flag` 全局标志实现跨线程安全停止
+
+---
+
+## 9. 多页面自由查询的配置驱动模式
+
+### 问题
+收入、支出、退库、库存等自由查询页面技术路径相似，但菜单名称、iframe、字段集合、复选框集合并不完全一致。如果在导航、填表、导出等函数中硬编码分支，后续扩展库存会牵一发动全身。
+
+### 解决方案：集中页面配置
+
+```python
+REPORT_CONFIGS = {
+    "收入": {
+        "menu_title": "收入数据自由查询",
+        "iframe_name": "fineReportTsasRpt6010",
+        "dropdown_fields": [...],
+        "date_fields": ["pStartDate", "pEndDate"],
+        "text_fields": [...],
+        "checkbox_fields": [...],
+        "template_columns": [...],
+        "sample": {...},
+    },
+}
+```
+
+### 好处
+- 新增页面时优先新增配置，减少修改执行链路。
+- `generate_template()` 可直接按配置生成 Sheet。
+- `_fill_form()`、`_click_query_and_wait()`、`_export_and_save()` 都能复用同一套流程。
+
+---
+
+## 10. 核对场景的精确命名控制
+
+### 场景
+历史数据核对要求网页版 new 报表按 `newsr2003`、`newzc2003`、`newtk2003` 等固定规则命名。如果继续沿用 `{自定义名}_{日期}_{系统原文件名}`，后续一键核对无法直接识别。
+
+### 解决方案
+
+参数表新增两个可选列：
+
+| 列名 | 取值 | 含义 |
+|---|---|---|
+| `是否追加日期` | `1/0` | 是否在 `文件名称` 后追加日期 |
+| `保留原文件名` | `1/0` | 是否继续拼接系统导出的原始文件名 |
+
+核对专用参数表将两列都设为 `0`，导出文件会精确保存为 `文件名称 + 扩展名`。

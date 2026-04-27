@@ -13,6 +13,9 @@ __pycache__/
 .venv/
 venv/
 
+# Playwright local browsers
+.playwright-browsers/
+
 # macOS
 .DS_Store
 

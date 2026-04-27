@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TMIS数据批量抓取工具 v5.0
+TMIS数据自由查询批量抓取工具 v5.1
 ===========================
 使用 Playwright 自动启动系统 Chrome 浏览器，携 Token 登录内网系统，
 自动填表、查询、导出报表，并可选数据后处理。
@@ -10,11 +10,11 @@ TMIS数据批量抓取工具 v5.0
 1. URL 狙击手：捕获 Token 链接 + 自动启动浏览器执行任务
 2. 自动检测系统 Chrome（channel="chrome"），支持手动指定路径
 3. 智能/自定义命名（参数表"文件名称"列 或 自动命名）
-4. 收入/支出业务分流（侧边栏动态导航、字段复用映射）
+4. 收入/支出/退库业务分流（侧边栏动态导航、字段复用映射）
 5. 可选数据后处理（openpyxl 保留原始格式）
 6. UI 日期选择器（默认当日，Excel参数优先）
 7. 查询成功精确检测（等待"原样导出"按钮可用）
-8. 智能标签页管理（收支切换时自动关闭旧标签页，防止 DOM 冲突）
+8. 智能标签页管理（类型切换时自动关闭旧标签页，防止 DOM 冲突）
 
 依赖：pip install playwright pandas openpyxl psutil
       pip install pyperclip  (可选)
@@ -71,7 +71,115 @@ COLUMN_MAPPING = {
     "预算科目": "pSbtCode",
     "科目级次": "pStatSbtLevel",
     "金额单位": "pAmtUnit",
-    "分国库查询": "pByTre",
+    "分国库查询": "pByTre",  # 兼容旧模板
+    "预算单位": "pBdgOrgCode",
+    "银行大类": "pBnkClass",
+    "计划单列市/县/乡": "pSigTreArea",
+    "展示范围": "pShowScope",
+    "退库原因": "pDwbkReason",
+}
+
+
+# ============================================================================
+# 自由查询页面配置
+# ============================================================================
+REPORT_CONFIGS = {
+    "收入": {
+        "menu_title": "收入数据自由查询",
+        "iframe_name": "fineReportTsasRpt6010",
+        "dropdown_fields": [
+            "pRptDbType", "pTrimFlag", "pRptType", "pGovernFlag",
+            "pTaxOrgProp", "pSigTreArea", "pStatSbtLevel", "pShowScope", "pAmtUnit",
+        ],
+        "date_fields": ["pStartDate", "pEndDate"],
+        "text_fields": ["pTreCode", "pBdgLevel", "pSbtCode"],
+        "checkbox_fields": ["分序时", "分地区", "分预算级次", "分预算科目", "分征收机关", "是否展示同比"],
+        "template_columns": [
+            "文件名称", "是否追加日期", "保留原文件名",
+            "报表库选择", "调整期标志", "报表类型", "起始日期", "终止日期",
+            "国库选择", "辖属标志", "预算级次", "征收机关性质", "预算科目",
+            "计划单列市/县/乡", "科目级次", "展示范围", "金额单位",
+            "分序时", "分地区", "分预算级次", "分预算科目", "分征收机关", "是否展示同比",
+        ],
+        "sample": {
+            "文件名称": "收入自由查询", "是否追加日期": "1", "保留原文件名": "1",
+            "报表库选择": "1 -- 报表库", "调整期标志": "0 -- 正常期", "报表类型": "",
+            "起始日期": "202601", "终止日期": "202601",
+            "国库选择": "", "辖属标志": "0 -- 全辖", "预算级次": "",
+            "征收机关性质": "0000000000 -- 不分征收机关", "预算科目": "",
+            "计划单列市/县/乡": "0 -- 不含", "科目级次": "4 -- 目",
+            "展示范围": "1 -- 下级", "金额单位": "2 -- 万元",
+            "分序时": "1", "分地区": "0", "分预算级次": "1",
+            "分预算科目": "1", "分征收机关": "0", "是否展示同比": "0",
+        },
+    },
+    "支出": {
+        "menu_title": "支出数据自由查询",
+        "iframe_name": "fineReportTsasRpt6020",
+        "dropdown_fields": [
+            "pRptDbType", "pTrimFlag", "pRptType", "pGovernFlag",
+            "pBdgOrgCode", "pBnkClass", "pSigTreArea", "pStatSbtLevel", "pShowScope", "pAmtUnit",
+        ],
+        "date_fields": ["pStartDate", "pEndDate"],
+        "text_fields": ["pTreCode", "pBdgLevel", "pSbtCode"],
+        "checkbox_fields": [
+            "分序时", "分地区", "分预算单位", "分银行大类",
+            "分预算级次", "分预算科目", "是否展示同比",
+        ],
+        "template_columns": [
+            "文件名称", "是否追加日期", "保留原文件名",
+            "报表库选择", "调整期标志", "报表类型", "起始日期", "终止日期",
+            "国库选择", "辖属标志", "预算单位", "银行大类", "预算级次", "预算科目",
+            "计划单列市/县/乡", "科目级次", "展示范围", "金额单位",
+            "分序时", "分地区", "分预算单位", "分银行大类",
+            "分预算级次", "分预算科目", "是否展示同比",
+        ],
+        "sample": {
+            "文件名称": "支出自由查询", "是否追加日期": "1", "保留原文件名": "1",
+            "报表库选择": "1 -- 报表库", "调整期标志": "0 -- 正常期", "报表类型": "",
+            "起始日期": "202601", "终止日期": "202601",
+            "国库选择": "", "辖属标志": "0 -- 全辖",
+            "预算单位": "ALL -- ALL", "银行大类": "0 -- 全部",
+            "预算级次": "", "预算科目": "",
+            "计划单列市/县/乡": "0 -- 不含", "科目级次": "4 -- 目",
+            "展示范围": "1 -- 下级", "金额单位": "2 -- 万元",
+            "分序时": "1", "分地区": "0", "分预算单位": "0", "分银行大类": "0",
+            "分预算级次": "1", "分预算科目": "1", "是否展示同比": "0",
+        },
+    },
+    "退库": {
+        "menu_title": "退库数据自由查询",
+        "iframe_name": "fineReportTsasRpt6030",
+        "dropdown_fields": [
+            "pRptDbType", "pTrimFlag", "pRptType", "pGovernFlag",
+            "pTaxOrgProp", "pSigTreArea", "pStatSbtLevel", "pAmtUnit",
+        ],
+        "date_fields": ["pStartDate", "pEndDate"],
+        "text_fields": ["pTreCode", "pBdgLevel", "pSbtCode", "pDwbkReason"],
+        "checkbox_fields": [
+            "分序时", "分地区", "分征收机关", "分预算级次",
+            "分退库原因", "分预算科目", "是否展示同比",
+        ],
+        "template_columns": [
+            "文件名称", "是否追加日期", "保留原文件名",
+            "报表库选择", "调整期标志", "报表类型", "起始日期", "终止日期",
+            "国库选择", "辖属标志", "征收机关性质", "预算级次", "预算科目", "退库原因",
+            "计划单列市/县/乡", "科目级次", "金额单位",
+            "分序时", "分地区", "分征收机关", "分预算级次",
+            "分退库原因", "分预算科目", "是否展示同比",
+        ],
+        "sample": {
+            "文件名称": "退库自由查询", "是否追加日期": "1", "保留原文件名": "1",
+            "报表库选择": "1 -- 报表库", "调整期标志": "0 -- 正常期", "报表类型": "",
+            "起始日期": "202601", "终止日期": "202601",
+            "国库选择": "", "辖属标志": "0 -- 全辖",
+            "征收机关性质": "0000000000 -- 不分征收机关",
+            "预算级次": "", "预算科目": "", "退库原因": "",
+            "计划单列市/县/乡": "0 -- 不含", "科目级次": "4 -- 目", "金额单位": "2 -- 万元",
+            "分序时": "1", "分地区": "0", "分征收机关": "0", "分预算级次": "1",
+            "分退库原因": "1", "分预算科目": "1", "是否展示同比": "0",
+        },
+    },
 }
 
 
@@ -102,7 +210,7 @@ class TMISAutoApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("TMIS  数据批量抓取工具 v5.0")
+        self.title("TMIS  数据自由查询批量抓取工具 v5.1")
         self.geometry("980x820")
         self.resizable(True, True)
         self.configure(bg=self.BG_PRIMARY)
@@ -132,7 +240,7 @@ class TMISAutoApp(tk.Tk):
         # Chrome 路径（空=自动检测）
         self.chrome_path_var = tk.StringVar()
 
-        # 记录当前导航到的收支类型
+        # 记录当前导航到的数据类型
         self.current_nav_type = None
 
         # 构建 GUI
@@ -207,9 +315,9 @@ class TMISAutoApp(tk.Tk):
         header = ttk.Frame(container, style="Main.TFrame")
         header.pack(fill=tk.X, pady=(0, 12))
 
-        ttk.Label(header, text="TMIS  数据批量抓取工具",
+        ttk.Label(header, text="TMIS  数据自由查询批量抓取工具",
                   style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header, text="v5.0   |   自动填表 / 查询 / 导出 / 清洗",
+        ttk.Label(header, text="v5.1   |   收入 / 支出 / 退库 自动填表 / 查询 / 导出 / 清洗",
                   style="Subtitle.TLabel").pack(side=tk.LEFT, padx=(16, 0), pady=(8, 0))
 
         # ============ 文件选择卡片 ============
@@ -574,14 +682,14 @@ class TMISAutoApp(tk.Tk):
             
             for sheet_name, df_sheet in sheet_dict.items():
                 current_sheet_sz_type = None
-                if "收入" in sheet_name:
-                    current_sheet_sz_type = "收入"
-                elif "支出" in sheet_name:
-                    current_sheet_sz_type = "支出"
+                for report_type in REPORT_CONFIGS:
+                    if report_type in sheet_name:
+                        current_sheet_sz_type = report_type
+                        break
                 else:
-                    # 尝试从历史“收支类型”列获取，兼容老模板
-                    if "收支类型" not in df_sheet.columns:
-                        continue # 既不是收入也不是支出，跳过
+                    # 尝试从历史“收支类型/数据类型”列获取，兼容老模板
+                    if "收支类型" not in df_sheet.columns and "数据类型" not in df_sheet.columns:
+                        continue
                 
                 df_sheet = df_sheet.fillna("")
                 
@@ -596,17 +704,21 @@ class TMISAutoApp(tk.Tk):
                     df_sheet.rename(columns=new_columns, inplace=True)
                 
                 for _, row in df_sheet.iterrows():
-                    # 如果行内本身有“收支类型”则优先（兼容老模板）
-                    row_sz = str(row.get("收支类型", "")).strip()
-                    if row_sz in ("收入", "支出"):
+                    # 如果行内本身有“收支类型/数据类型”则优先（兼容老模板）
+                    row_sz = str(row.get("收支类型", row.get("数据类型", ""))).strip()
+                    if row_sz in REPORT_CONFIGS:
                         current_sz_type = row_sz
                     else:
                         current_sz_type = current_sheet_sz_type if current_sheet_sz_type else "收入"
+
+                    if current_sz_type not in REPORT_CONFIGS:
+                        self.log(f"跳过暂不支持的任务类型: {current_sz_type}", "WARN")
+                        continue
                         
                     tasks.append((current_sz_type, row))
                     
             if not tasks:
-                self.log("未在Excel中找到有效的任务数据 (请检查Sheet名称是否包含'收入'或'支出')", "ERROR")
+                self.log("未在Excel中找到有效的任务数据 (请检查Sheet名称是否包含'收入'/'支出'/'退库')", "ERROR")
                 return
                 
             total = len(tasks)
@@ -692,7 +804,10 @@ class TMISAutoApp(tk.Tk):
 
                     await self._click_query_and_wait(page, sz_type)
 
-                    saved_path = await self._export_and_save(page, dl_folder, dynamic_name, sz_type)
+                    keep_original_name = self._should_keep_original_name(row)
+                    saved_path = await self._export_and_save(
+                        page, dl_folder, dynamic_name, sz_type, keep_original_name
+                    )
 
                     if self.enable_postprocess.get() and saved_path and os.path.exists(saved_path):
                         self._process_excel_data(saved_path, row, sz_type)
@@ -740,6 +855,9 @@ class TMISAutoApp(tk.Tk):
         if self.naming_mode.get() == "param":
             custom_name = str(row.get("文件名称", "")).strip()
             if custom_name:
+                append_date = str(row.get("是否追加日期", "1")).strip().lower()
+                if append_date in ("0", "否", "false", "no", "n"):
+                    return re.sub(r'[\\/:*?"<>|]', '', custom_name)
                 if start_date == end_date or not end_date:
                     date_part = start_date if start_date else ""
                 else:
@@ -757,7 +875,7 @@ class TMISAutoApp(tk.Tk):
 
         bdg_level = str(row.get("pBdgLevel", "")).strip()
         bdg_code = bdg_level.split("--")[0].strip() if "--" in bdg_level else bdg_level
-        scale_part = "全口径" if bdg_code == "0" else "地方"
+        scale_part = "全口径" if bdg_code in ("", "0") else "地方"
 
         by_tre = str(row.get("pByTre", "")).strip()
         if "--" in by_tre:
@@ -768,7 +886,8 @@ class TMISAutoApp(tk.Tk):
             chinese_chars = re.findall(r'[\u4e00-\u9fff]+', by_tre)
             tre_name = "".join(chinese_chars) if chinese_chars else by_tre
         if not tre_name:
-            tre_name = "全国"
+            tre_code = str(row.get("pTreCode", "")).strip()
+            tre_name = tre_code if tre_code else "全国"
 
         name = f"{date_part}_{scale_part}_{sz_type}_{tre_name}"
         safe_name = re.sub(r'[\\/:*?"<>|]', '', name)
@@ -781,12 +900,17 @@ class TMISAutoApp(tk.Tk):
 
         return safe_name
 
+    def _should_keep_original_name(self, row: pd.Series) -> bool:
+        """是否在自定义文件名前继续拼接系统原始导出文件名。"""
+        keep = str(row.get("保留原文件名", "1")).strip().lower()
+        return keep not in ("0", "否", "false", "no", "n")
+
     # ========================================================================
     # 需求4：智能侧边栏操作与标签页管理
     # ========================================================================
     async def _close_current_tab(self, page: Page, sz_type: str):
         """关闭当前的查询标签页，防止多标签页 DOM 冲突"""
-        tab_name = f"总库{sz_type}数据自由查询"
+        tab_name = REPORT_CONFIGS.get(sz_type, {}).get("menu_title", f"{sz_type}数据自由查询")
         self.log(f"  尝试关闭标签页: {tab_name}...", "INFO")
         try:
             # 找到包含对应文本的 tab 节点，然后再点它里面的 .el-icon-close
@@ -802,27 +926,29 @@ class TMISAutoApp(tk.Tk):
 
     async def _navigate_sidebar_smart(self, page: Page, sz_type: str):
         """
-        智能导航侧边栏。根据收支类型动态拼接目标菜单。
+        智能导航侧边栏。根据数据类型动态拼接目标菜单。
         如果当前已经导航到同一类型，跳过。
 
-        导航路径：固定报表 -> 数据自由查询 -> 总库数据自由查询 -> 总库{收入/支出}数据自由查询
+        导航路径：固定报表 -> 数据自由查询 -> {收入/支出/退库}数据自由查询
         """
+        config = REPORT_CONFIGS[sz_type]
+        menu_title = config["menu_title"]
+
         if self.current_nav_type and self.current_nav_type != sz_type:
-            self.log(f"  检测到收支类型将切换（{self.current_nav_type} -> {sz_type}），正在关闭旧标签页...", "WARN")
+            self.log(f"  检测到数据类型将切换（{self.current_nav_type} -> {sz_type}），正在关闭旧标签页...", "WARN")
             await self._close_current_tab(page, self.current_nav_type)
 
         if self.current_nav_type == sz_type:
-            self.log(f"  当前已在「总库{sz_type}数据自由查询」页面，跳过导航", "INFO")
+            self.log(f"  当前已在「{menu_title}」页面，跳过导航", "INFO")
             return
 
-        self.log(f"  导航到「总库{sz_type}数据自由查询」...")
+        self.log(f"  导航到「{menu_title}」...")
 
         # 完整菜单路径
         menu_items = [
             "固定报表",
             "数据自由查询",
-            "总库数据自由查询",
-            f"总库{sz_type}数据自由查询",
+            menu_title,
         ]
 
         for item_text in menu_items:
@@ -835,7 +961,7 @@ class TMISAutoApp(tk.Tk):
             except Exception:
                 is_vis = False
 
-            if item_text in ("固定报表", "数据自由查询", "总库数据自由查询"):
+            if item_text in ("固定报表", "数据自由查询"):
                 # 对于父级菜单，如果目标子菜单已经可见，可跳过点击
                 # 检查下一级菜单是否已可见
                 next_idx = menu_items.index(item_text) + 1
@@ -866,14 +992,14 @@ class TMISAutoApp(tk.Tk):
                     raise
 
         self.current_nav_type = sz_type
-        self.log(f"  导航完成: 总库{sz_type}数据自由查询", "SUCCESS")
+        self.log(f"  导航完成: {menu_title}", "SUCCESS")
 
     # ========================================================================
     # 需求4：表单填充（支持收入/支出分流）
     # ========================================================================
     async def _fill_form(self, page: Page, row: pd.Series, sz_type: str):
         """
-        填充表单，根据收支类型分流处理字段。
+        填充表单，根据数据类型分流处理字段。
 
         Args:
             page: Playwright Page 对象
@@ -881,26 +1007,10 @@ class TMISAutoApp(tk.Tk):
             sz_type: "收入" 或 "支出"
         """
         self.log("  开始填充表单...")
+        config = REPORT_CONFIGS[sz_type]
 
         # ---- 下拉选择字段 ----
-        dropdown_fields = [
-            "pRptDbType",       # 报表库选择
-            "pTrimFlag",        # 调整期标志
-            "pRptType",         # 报表类型
-            "pGovernFlag",      # 辖属标志
-            "pStatSbtLevel",    # 科目级次
-            "pAmtUnit",         # 金额单位
-            "pByTre",           # 分国库查询
-        ]
-
-        # 收入特有：征收机关性质；支出特有：预算单位、银行大类
-        if sz_type == "收入":
-            dropdown_fields.append("pTaxOrgProp")
-        elif sz_type == "支出":
-            dropdown_fields.append("pBdgOrgCode")
-            dropdown_fields.append("pBnkClass")
-
-        for field_id in dropdown_fields:
+        for field_id in config["dropdown_fields"]:
             val = str(row.get(field_id, "")).strip()
             if not val:
                 continue
@@ -911,7 +1021,7 @@ class TMISAutoApp(tk.Tk):
             "pStartDate": self.start_date_var.get().strip(),
             "pEndDate": self.end_date_var.get().strip(),
         }
-        for field_id in ["pStartDate", "pEndDate"]:
+        for field_id in config["date_fields"]:
             val = str(row.get(field_id, "")).strip()
             if not val:
                 val = ui_dates.get(field_id, "")
@@ -920,14 +1030,13 @@ class TMISAutoApp(tk.Tk):
             await self._fill_date(page, field_id, val)
 
         # ---- 文本输入字段 ----
-        text_fields = ["pTreCode", "pBdgLevel", "pSbtCode"]
-        for field_id in text_fields:
+        for field_id in config["text_fields"]:
             val = str(row.get(field_id, "")).strip()
             if not val:
                 continue
             await self._fill_text_input(page, field_id, val)
 
-        # ---- 复选框（根据收支类型分流） ----
+        # ---- 复选框（根据数据类型分流） ----
         await self._fill_checkboxes(page, row, sz_type)
 
         self.log("  表单填充完成", "SUCCESS")
@@ -935,39 +1044,12 @@ class TMISAutoApp(tk.Tk):
     async def _fill_checkboxes(self, page: Page, row: pd.Series, sz_type: str):
         """
         处理复选框。
-        根据新的分离表头设计，直接去取对应中文列名的值。
-        保留对旧版本"合并列"的兼容性读取。
+        根据当前自由查询页面配置，直接读取对应中文列名的 0/1 值。
         """
-        # 通用复选框
-        common_checkboxes = ["分序时", "分预算级次", "是否展示同比"]
-        for cb_name in common_checkboxes:
+        for cb_name in REPORT_CONFIGS[sz_type]["checkbox_fields"]:
             val = str(row.get(cb_name, "")).strip()
             if val:
                 await self._set_checkbox(page, cb_name, int(val))
-
-        # 收入复选框
-        if sz_type == "收入":
-            org_val = str(row.get("分征收机关", row.get("分征收机关/预算单位", ""))).strip()
-            if org_val:
-                await self._set_checkbox(page, "分征收机关", int(org_val))
-                
-            sbt_val = str(row.get("分预算科目", row.get("分预算/功能科目", ""))).strip()
-            if sbt_val:
-                await self._set_checkbox(page, "分预算科目", int(sbt_val))
-
-        # 支出复选框
-        elif sz_type == "支出":
-            org_val = str(row.get("分预算单位", row.get("分征收机关/预算单位", ""))).strip()
-            if org_val:
-                await self._set_checkbox(page, "分预算单位", int(org_val))
-                
-            sbt_val = str(row.get("分功能科目", row.get("分预算/功能科目", ""))).strip()
-            if sbt_val:
-                await self._set_checkbox(page, "分功能科目", int(sbt_val))
-                
-            bank_val = str(row.get("分银行大类", "")).strip()
-            if bank_val:
-                await self._set_checkbox(page, "分银行大类", int(bank_val))
 
 
     # ========================================================================
@@ -978,7 +1060,7 @@ class TMISAutoApp(tk.Tk):
         self.log(f"    日期 {field_id} = {value}")
 
         # 精确定位：先找到包含该 label 的 form-item 容器，再在容器内找日期输入框
-        form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
+        form_item = page.locator(f'.el-form-item:visible:has(label[for="{field_id}"])').first
         inp = form_item.locator('.el-date-editor .el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
@@ -998,7 +1080,7 @@ class TMISAutoApp(tk.Tk):
         self.log(f"    文本 {field_id} = {value}")
 
         # 精确定位：先找到包含该 label 的 form-item 容器，再在容器内找文本输入框
-        form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
+        form_item = page.locator(f'.el-form-item:visible:has(label[for="{field_id}"])').first
         inp = form_item.locator('.el-input .el-input__inner').first
         await inp.wait_for(state="visible", timeout=10000)
 
@@ -1020,7 +1102,7 @@ class TMISAutoApp(tk.Tk):
         self.log(f"    下拉 {field_id} = {value}")
 
         # 精确定位：先找到包含该 label 的 form-item 容器，再在容器内找下拉输入框
-        form_item = page.locator(f'.el-form-item:has(label[for="{field_id}"])').first
+        form_item = page.locator(f'.el-form-item:visible:has(label[for="{field_id}"])').first
         dropdown_input = form_item.locator('.el-select .el-input__inner').first
         await dropdown_input.wait_for(state="visible", timeout=10000)
         await dropdown_input.click()
@@ -1063,12 +1145,12 @@ class TMISAutoApp(tk.Tk):
         """设置复选框状态（通过 is-checked 类判断）"""
         self.log(f"    复选框 '{label_text}' -> {'勾选' if target == 1 else '取消'}")
 
-        cb_locator = page.locator(f"label.el-checkbox:has-text('{label_text}')").first
+        cb_locator = page.locator(f"label.el-checkbox:visible:has-text('{label_text}')").first
 
         try:
             await cb_locator.wait_for(state="visible", timeout=5000)
         except Exception:
-            self.log(f"    复选框 '{label_text}' 未找到（当前收支类型可能无此字段），跳过", "WARN")
+            self.log(f"    复选框 '{label_text}' 未找到（当前数据类型可能无此字段），跳过", "WARN")
             return
 
         class_attr = await cb_locator.get_attribute("class") or ""
@@ -1085,14 +1167,14 @@ class TMISAutoApp(tk.Tk):
         """点击查询按钮，等待"原样导出"按钮 ui-state-enabled。超时6分钟。"""
         self.log("  点击查询按钮...")
 
-        query_btn = page.locator("button.el-button:has-text('查询')").first
+        query_btn = page.locator("button.el-button:visible:has-text('查询')").first
         await query_btn.wait_for(state="visible", timeout=5000)
         await query_btn.click()
 
         self.log("  等待数据查询完成（检测'原样导出'按钮状态，最长6分钟）...")
         await asyncio.sleep(3)
 
-        iframe_name = "fineReportTsasRpt6060" if sz_type == "支出" else "fineReportTsasRpt6050"
+        iframe_name = REPORT_CONFIGS[sz_type]["iframe_name"]
         self.log(f"  使用 iframe: {iframe_name}")
         iframe = page.frame_locator(f'iframe[name="{iframe_name}"]')
         export_indicator = iframe.locator('.fr-btn[widgetname="ExcelO"]')
@@ -1118,15 +1200,22 @@ class TMISAutoApp(tk.Tk):
     # ========================================================================
     # 需求2：强力导出（force=True 穿透透明遮挡层）
     # ========================================================================
-    async def _export_and_save(self, page: Page, dl_folder: str, dynamic_name: str, sz_type: str = "收入") -> str:
+    async def _export_and_save(
+        self,
+        page: Page,
+        dl_folder: str,
+        dynamic_name: str,
+        sz_type: str = "收入",
+        keep_original_name: bool = True,
+    ) -> str:
         """
         切入 iframe，使用 force=True 点击"原样导出"，保存文件。
         返回保存的绝对路径。
         """
         self.log("  准备导出数据...")
 
-        # 切入帆软报表 iframe（收入6050，支出6060）
-        iframe_name = "fineReportTsasRpt6060" if sz_type == "支出" else "fineReportTsasRpt6050"
+        # 切入帆软报表 iframe（收入6010，支出6020，退库6030）
+        iframe_name = REPORT_CONFIGS[sz_type]["iframe_name"]
         iframe = page.frame_locator(f'iframe[name="{iframe_name}"]')
 
         # 使用 get_by_text 精确定位"原样导出"按钮
@@ -1142,8 +1231,12 @@ class TMISAutoApp(tk.Tk):
         download = await download_info.value
         original_name = download.suggested_filename or "report.xlsx"
 
-        # 文件名：{动态名}_{原文件名}
-        new_filename = f"{dynamic_name}_{original_name}"
+        # 默认保持历史行为：{动态名}_{原文件名}；核对专用模板可关闭，精确输出指定文件名。
+        ext = os.path.splitext(original_name)[1] or ".xlsx"
+        if keep_original_name:
+            new_filename = f"{dynamic_name}_{original_name}"
+        else:
+            new_filename = f"{dynamic_name}{ext}"
         save_path = os.path.join(dl_folder, new_filename)
 
         await download.save_as(save_path)
@@ -1241,50 +1334,15 @@ class TMISAutoApp(tk.Tk):
 # ============================================================================
 # Excel参数模板生成
 # ============================================================================
-def generate_template(output_path: str = "TMIS参数模板_v5.0.xlsx"):
-    """生成 v5.0 版Excel参数模板（分收入/支出 Sheet，全中文表头）"""
-    columns_income = [
-        "文件名称", "报表库选择", "调整期标志", "报表类型", "起始日期", "终止日期",
-        "国库选择", "辖属标志", "预算级次", "征收机关性质", "预算科目", "科目级次",
-        "金额单位", "分序时", "分国库查询", "分预算级次", "是否展示同比", "分征收机关", "分预算科目"
-    ]
-    
-    columns_expense = [
-        "文件名称", "报表库选择", "调整期标志", "报表类型", "起始日期", "终止日期",
-        "国库选择", "辖属标志", "预算级次", "预算科目", "科目级次", "金额单位",
-        "分序时", "分国库查询", "分预算级次", "是否展示同比", "分预算单位", "分功能科目", "分银行大类"
-    ]
-
-    sample_income = {
-        "文件名称": "全口径收入_中央",
-        "报表库选择": "", "调整期标志": "", "报表类型": "",
-        "起始日期": "202601", "终止日期": "202601",
-        "国库选择": "", "辖属标志": "0 -- 全辖",
-        "预算级次": "", "征收机关性质": "0000000000 -- 不分征收机关",
-        "预算科目": "", "科目级次": "4 -- 目", "金额单位": "2 -- 万元",
-        "分序时": "0", "分国库查询": "1 -- 中央", "分预算级次": "0",
-        "是否展示同比": "1", "分征收机关": "0", "分预算科目": "1",
-    }
-
-    sample_expense = {
-        "文件名称": "全口径支出_省",
-        "报表库选择": "", "调整期标志": "", "报表类型": "",
-        "起始日期": "202601", "终止日期": "202601",
-        "国库选择": "", "辖属标志": "0 -- 全辖",
-        "预算级次": "", "预算科目": "",
-        "科目级次": "4 -- 目", "金额单位": "2 -- 万元",
-        "分序时": "0", "分国库查询": "2 -- 省", "分预算级次": "0",
-        "是否展示同比": "1", "分预算单位": "1", "分功能科目": "1",
-        "分银行大类": "0",
-    }
-
-    df_income = pd.DataFrame([sample_income], columns=columns_income)
-    df_expense = pd.DataFrame([sample_expense], columns=columns_expense)
-    
+def generate_template(output_path: str = "TMIS数据自由查询参数模板_v5.1.xlsx"):
+    """生成数据自由查询参数模板（分收入/支出/退库 Sheet，全中文表头）"""
     with pd.ExcelWriter(output_path) as writer:
-        df_income.to_excel(writer, sheet_name="收入参数", index=False)
-        df_expense.to_excel(writer, sheet_name="支出参数", index=False)
-        
+        for report_type, config in REPORT_CONFIGS.items():
+            columns = config["template_columns"]
+            sample = config["sample"]
+            df = pd.DataFrame([sample], columns=columns)
+            df.to_excel(writer, sheet_name=f"{report_type}参数", index=False)
+
     print(f"参数模板已生成: {output_path}")
 
 
@@ -1293,13 +1351,13 @@ def generate_template(output_path: str = "TMIS参数模板_v5.0.xlsx"):
 # ============================================================================
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--template":
-        out = sys.argv[2] if len(sys.argv) > 2 else "TMIS参数模板_v5.0.xlsx"
+        out = sys.argv[2] if len(sys.argv) > 2 else "TMIS数据自由查询参数模板_v5.1.xlsx"
         generate_template(out)
         return
 
     app = TMISAutoApp()
 
-    app.log("TMIS 数据批量抓取工具 v5.0 就绪", "SUCCESS")
+    app.log("TMIS 数据自由查询批量抓取工具 v5.1 就绪", "SUCCESS")
     app.log("")
     app.log("全自动使用步骤")
     app.log("  1  选择 Excel 参数模板")
