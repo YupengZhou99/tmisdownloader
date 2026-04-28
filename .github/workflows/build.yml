@@ -2,13 +2,16 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
+      - "codex/**"
   workflow_dispatch:          # 支持手动在 Actions 页面触发
 
 jobs:
   build:
-    name: PyInstaller · windows-latest · Python 3.11
-    runs-on: windows-latest
+    name: PyInstaller · Windows x64 · Python 3.11
+    runs-on: windows-2022
 
     steps:
       # ── 1. 检出代码 ──────────────────────────────────────────────
@@ -25,7 +28,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright==1.49.0 pandas openpyxl psutil pyperclip pyinstaller
+          pip install -r requirements.txt
 
       # ── 4. 安装 Playwright 驱动（Node.js driver，不含浏览器）──
       # 注意：程序运行时使用系统 Chrome（channel=chrome），
@@ -71,16 +74,30 @@ jobs:
         run: dir dist
 
       # ── 8. 复制模板文件到 dist ────────────────────────────────────
-      - name: Copy template to dist
-        run: copy "国库列表模板.xlsx" dist\
+      - name: Copy templates to dist
+        shell: pwsh
+        run: |
+          $files = @(
+            "国库列表模板.xlsx",
+            "TMIS数据自由查询参数模板_v5.1.xlsx",
+            "TMIS网页版new正常期收入支出退库库存参数表_1009000000_v5.1.xlsx",
+            "TMIS网页版new正常期收入支出退库库存参数表_1000000000_省级_v5.1.xlsx",
+            "README_V5.0_副本.md"
+          )
+          foreach ($file in $files) {
+            if (Test-Path $file) {
+              Copy-Item $file dist\
+            }
+          }
 
       # ── 9. 上传 EXE + 模板为 Artifact（保留 30 天）──────────────
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: TMIS-Windows64-EXE
+          name: TMIS-Windows10-x64-EXE
           path: |
             dist/*.exe
             dist/*.xlsx
+            dist/*.md
           retention-days: 30
           if-no-files-found: error

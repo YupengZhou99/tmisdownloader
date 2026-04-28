@@ -30,6 +30,7 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import pandas as pd
 from openpyxl import load_workbook
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import time
 import traceback
 import asyncio
@@ -54,6 +55,7 @@ except ImportError:
 # ============================================================================
 stop_flag = False          # 停止批量任务
 sniper_flag = False        # 停止URL狙击手
+SPECIAL_ZERO_SUBJECT_CODES = {"23099", "23106", "2310601", "23202", "2320202"}
 
 # ============================================================================
 # Excel 中文表头映射词典
@@ -419,7 +421,7 @@ class TMISAutoApp(tk.Tk):
         opt_card.pack(fill=tk.X, pady=(0, 10))
 
         tk.Checkbutton(
-            opt_card, text="启用数据后处理（新增预算级次列+剔除计划单列市）",
+            opt_card, text="启用数据后处理（按PPT清理库存列/零值特殊科目）",
             variable=self.enable_postprocess,
             bg=self.BG_CARD, fg=self.FG_SECONDARY, activebackground=self.BG_CARD,
             activeforeground=self.FG_PRIMARY, selectcolor=self.BG_INPUT,
@@ -1286,8 +1288,8 @@ class TMISAutoApp(tk.Tk):
     # 数据后处理（openpyxl 保留格式）
     # ========================================================================
     def _process_excel_data(self, file_path: str, row: pd.Series, sz_type: str):
-        """使用 openpyxl 后处理，保留原始格式。"""
-        self.log("  开始数据后处理（openpyxl 保留格式）...")
+        """按附件2要求清理自由查询导出表，保留原始格式。"""
+        self.log("  开始数据后处理（按PPT要求清理）...")
         try:
             wb = load_workbook(file_path)
             ws = wb.active
@@ -1300,97 +1302,149 @@ class TMISAutoApp(tk.Tk):
             wb.close()
             return
 
+        changed = False
         if sz_type == "库存":
-            stock_city_col = None
-            for c in range(1, ws.max_column + 1):
-                header = str(ws.cell(row=1, column=c).value or "").strip()
-                if header == "所属市国库代码":
-                    stock_city_col = c
-                    break
-
+            stock_city_col = self._find_header_col(ws, "所属市国库代码")
             if stock_city_col is None:
                 self.log("    未找到'所属市国库代码'列，库存专用清理跳过", "INFO")
             else:
                 ws.delete_cols(stock_city_col, 1)
+                changed = True
                 self.log(f"    已删除库存报表'所属市国库代码'列（原第{stock_city_col}列）", "SUCCESS")
-
-            try:
-                wb.save(file_path)
-                self.log("  库存数据后处理完成，已覆盖保存（格式已保留）", "SUCCESS")
-            except Exception as e:
-                self.log(f"  保存库存后处理文件失败: {e}", "ERROR")
-            finally:
-                wb.close()
-            return
-
-        bdg_level = str(row.get("pBdgLevel", "")).strip()
-        bdg_code = bdg_level.split("--")[0].strip() if "--" in bdg_level else bdg_level
-        # 全口径(代码为0或空) → "0"；地方级(省2,3,4,5 / 市3,4,5 / 县4,5等) → "6"
-        if bdg_code == "0" or bdg_code == "":
-            budget_level = "0"
-        else:
-            budget_level = "6"
-
-        new_col = ws.max_column + 1
-        ws.cell(row=1, column=new_col, value="预算级次")
-        for r in range(2, ws.max_row + 1):
-            ws.cell(row=r, column=new_col, value=budget_level)
-        self.log(f"    已在末尾新增'预算级次'列（第{new_col}列），值={budget_level}")
-
-        by_tre = str(row.get("pByTre", "")).strip()
-        tre_code = by_tre.split("--")[0].strip() if "--" in by_tre else by_tre.strip()
-
-        if tre_code == "3":
-            # 市级报表，需要剔除计划单列市
-            plan_cities = {"深圳市", "厦门市", "青岛市", "宁波市", "大连市"}
-
-            # 动态查找"国库简称"列
-            city_col = None
-            for c in range(1, ws.max_column + 1):
-                header = str(ws.cell(row=1, column=c).value or "").strip()
-                if header == "国库简称":
-                    city_col = c
-                    break
-
-            if city_col is None:
-                self.log("    未找到'国库简称'列，跳过计划单列市剔除", "WARN")
+        elif sz_type in ("收入", "支出", "退库"):
+            removed = self._remove_zero_special_subject_rows(ws)
+            changed = removed > 0
+            if removed:
+                self.log(f"    已删除 {removed} 行发生额和累计额均为0的特殊科目", "SUCCESS")
             else:
-                self.log(f"    '国库简称'列位于第{city_col}列，开始检查计划单列市...")
-                rows_to_delete = []
-                for r in range(2, ws.max_row + 1):
-                    if str(ws.cell(row=r, column=city_col).value or "").strip() in plan_cities:
-                        rows_to_delete.append(r)
-                removed = 0
-                for r in reversed(rows_to_delete):
-                    ws.delete_rows(r, 1)
-                    removed += 1
-                if removed > 0:
-                    self.log(f"    已剔除 {removed} 行计划单列市数据", "SUCCESS")
-                else:
-                    self.log("    未发现计划单列市数据需要剔除")
-
-        # 新增：将特定列的格式设置为“常规” (General)
-        target_formats = {"本期执行数", "同期执行数", "同比增速(%)", "年累计", "同期年累计", "年累计同比增速(%)"}
-        format_cols = []
-        for c in range(1, ws.max_column + 1):
-            header = str(ws.cell(row=1, column=c).value or "").strip()
-            if header in target_formats:
-                format_cols.append(c)
-        
-        if format_cols:
-            self.log(f"    开始将 {len(format_cols)} 列的单元格格式设置为'常规'...")
-            for c in format_cols:
-                for r in range(2, ws.max_row + 1):
-                    ws.cell(row=r, column=c).number_format = 'General'
-            self.log("    单元格格式设置完成", "SUCCESS")
+                self.log("    未发现需要删除的零值特殊科目行", "INFO")
+        else:
+            self.log(f"    {sz_type} 暂无PPT指定后处理规则，跳过", "INFO")
 
         try:
-            wb.save(file_path)
-            self.log("  数据后处理完成，已覆盖保存（格式已保留）", "SUCCESS")
+            if changed:
+                wb.save(file_path)
+            self.log("  数据后处理完成", "SUCCESS")
         except Exception as e:
             self.log(f"  保存后处理文件失败: {e}", "ERROR")
         finally:
             wb.close()
+
+    def _remove_zero_special_subject_rows(self, ws):
+        header_row = self._find_free_query_header_row(ws)
+        if header_row is None:
+            self.log("    未识别到表头，零值特殊科目清理跳过", "WARN")
+            return 0
+
+        subject_cols = self._find_subject_code_cols(ws, header_row)
+        current_col = self._find_amount_col(
+            ws, header_row,
+            exact_names={"本期执行数", "本期发生额", "发生额"},
+            include_tokens=("本期",),
+            exclude_tokens=("同期", "同比", "累计"),
+        )
+        cumulative_col = self._find_amount_col(
+            ws, header_row,
+            exact_names={"年累计", "累计额"},
+            include_tokens=("累计",),
+            exclude_tokens=("同期", "同比"),
+        )
+
+        if current_col is None or cumulative_col is None:
+            self.log("    未找到发生额或累计额列，零值特殊科目清理跳过", "WARN")
+            return 0
+
+        rows_to_delete = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            if not self._row_has_special_subject(ws, r, subject_cols):
+                continue
+            if (
+                self._is_zero_amount(ws.cell(row=r, column=current_col).value)
+                and self._is_zero_amount(ws.cell(row=r, column=cumulative_col).value)
+            ):
+                rows_to_delete.append(r)
+
+        for r in reversed(rows_to_delete):
+            ws.delete_rows(r, 1)
+        return len(rows_to_delete)
+
+    def _find_free_query_header_row(self, ws):
+        max_scan = min(ws.max_row, 20)
+        for r in range(1, max_scan + 1):
+            headers = [self._norm_header(ws.cell(row=r, column=c).value)
+                       for c in range(1, ws.max_column + 1)]
+            has_subject = any("科目" in h for h in headers)
+            has_current = any(h in {"本期执行数", "本期发生额", "发生额"} for h in headers)
+            has_cumulative = any(h == "年累计" or h == "累计额" for h in headers)
+            if has_subject and (has_current or has_cumulative):
+                return r
+        return None
+
+    def _find_subject_code_cols(self, ws, header_row: int):
+        cols = []
+        for c in range(1, ws.max_column + 1):
+            header = self._norm_header(ws.cell(row=header_row, column=c).value)
+            if "科目" in header and ("代码" in header or "编码" in header):
+                cols.append(c)
+        return cols
+
+    def _row_has_special_subject(self, ws, row_idx: int, subject_cols):
+        scan_cols = subject_cols or range(1, ws.max_column + 1)
+        for c in scan_cols:
+            value = self._norm_subject(ws.cell(row=row_idx, column=c).value)
+            if value in SPECIAL_ZERO_SUBJECT_CODES:
+                return True
+        return False
+
+    def _find_amount_col(self, ws, header_row: int, exact_names, include_tokens, exclude_tokens):
+        for c in range(1, ws.max_column + 1):
+            header = self._norm_header(ws.cell(row=header_row, column=c).value)
+            if header in exact_names:
+                return c
+
+        for c in range(1, ws.max_column + 1):
+            header = self._norm_header(ws.cell(row=header_row, column=c).value)
+            if include_tokens and not all(token in header for token in include_tokens):
+                continue
+            if any(token in header for token in exclude_tokens):
+                continue
+            return c
+        return None
+
+    @staticmethod
+    def _norm_header(value):
+        return re.sub(r"\s+", "", str(value or "")).strip()
+
+    @staticmethod
+    def _norm_subject(value):
+        return re.sub(r"\s+", "", str(value or "")).strip().upper()
+
+    @staticmethod
+    def _is_zero_amount(value):
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return Decimal(str(value)) == 0
+        text = str(value).strip()
+        if not text:
+            return False
+        text = text.replace(",", "").replace("，", "").replace(" ", "")
+        if text in {"-", "--"}:
+            return False
+        if text.startswith("(") and text.endswith(")"):
+            text = "-" + text[1:-1]
+        try:
+            return Decimal(text) == 0
+        except (InvalidOperation, ValueError):
+            return False
+
+    @staticmethod
+    def _find_header_col(ws, header_name: str):
+        for c in range(1, ws.max_column + 1):
+            header = str(ws.cell(row=1, column=c).value or "").strip()
+            if header == header_name:
+                return c
+        return None
 
 
 # ============================================================================
