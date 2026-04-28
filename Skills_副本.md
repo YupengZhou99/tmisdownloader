@@ -93,7 +93,7 @@ while not captured:
 ### 解决方案
 
 ```python
-# 1. 通过 iframe name 切入（收入6010，支出6020，退库6030）
+# 1. 通过 iframe name 切入（收入6010，支出6020，退库6030，库存6040）
 iframe = page.frame_locator(f'iframe[name="{REPORT_CONFIGS[sz_type]["iframe_name"]}"]')
 
 # 2. 通过按钮 widgetname 属性检测查询完成状态
@@ -238,6 +238,13 @@ REPORT_CONFIGS = {
 - 新增页面时优先新增配置，减少修改执行链路。
 - `generate_template()` 可直接按配置生成 Sheet。
 - `_fill_form()`、`_click_query_and_wait()`、`_export_and_save()` 都能复用同一套流程。
+
+### 库存页面要点
+- 菜单为 `固定报表 -> 数据自由查询 -> 库存数据自由查询`。
+- iframe 为 `fineReportTsasRpt6040`。
+- 特有字段包括 `pTreAttrib`（国库属性）、`pBookSbt`（会计科目）、`pBookAcctName`（会计账户名称）。
+- 特有复选框包括 `分国库属性`、`分会计科目`、`分会计账户`。
+- 附件 2 要求省分库库存报表删除 `所属市国库代码` 列，可作为库存专用后处理。
 
 ---
 

@@ -10,7 +10,7 @@ TMIS数据自由查询批量抓取工具 v5.1
 1. URL 狙击手：捕获 Token 链接 + 自动启动浏览器执行任务
 2. 自动检测系统 Chrome（channel="chrome"），支持手动指定路径
 3. 智能/自定义命名（参数表"文件名称"列 或 自动命名）
-4. 收入/支出/退库业务分流（侧边栏动态导航、字段复用映射）
+4. 收入/支出/退库/库存业务分流（侧边栏动态导航、字段复用映射）
 5. 可选数据后处理（openpyxl 保留原始格式）
 6. UI 日期选择器（默认当日，Excel参数优先）
 7. 查询成功精确检测（等待"原样导出"按钮可用）
@@ -77,6 +77,10 @@ COLUMN_MAPPING = {
     "计划单列市/县/乡": "pSigTreArea",
     "展示范围": "pShowScope",
     "退库原因": "pDwbkReason",
+    "国库属性": "pTreAttrib",
+    "会计科目": "pBookSbt",
+    "会计账户": "pBookAcctName",
+    "会计账户名称": "pBookAcctName",
 }
 
 
@@ -178,6 +182,40 @@ REPORT_CONFIGS = {
             "计划单列市/县/乡": "0 -- 不含", "科目级次": "4 -- 目", "金额单位": "2 -- 万元",
             "分序时": "1", "分地区": "0", "分征收机关": "0", "分预算级次": "1",
             "分退库原因": "1", "分预算科目": "1", "是否展示同比": "0",
+        },
+    },
+    "库存": {
+        "menu_title": "库存数据自由查询",
+        "iframe_name": "fineReportTsasRpt6040",
+        "dropdown_fields": [
+            "pRptDbType", "pRptType", "pGovernFlag", "pTreAttrib",
+            "pSigTreArea", "pShowScope", "pAmtUnit",
+        ],
+        "date_fields": ["pStartDate", "pEndDate"],
+        "text_fields": ["pTreCode", "pBdgLevel", "pBookSbt", "pBookAcctName"],
+        "checkbox_fields": [
+            "分序时", "分地区", "分国库属性", "分预算级次",
+            "分会计科目", "分会计账户", "是否展示同比",
+        ],
+        "template_columns": [
+            "文件名称", "是否追加日期", "保留原文件名",
+            "报表库选择", "报表类型", "起始日期", "终止日期",
+            "国库选择", "辖属标志", "国库属性", "预算级次",
+            "会计科目", "会计账户名称", "计划单列市/县/乡",
+            "展示范围", "金额单位",
+            "分序时", "分地区", "分国库属性", "分预算级次",
+            "分会计科目", "分会计账户", "是否展示同比",
+        ],
+        "sample": {
+            "文件名称": "库存自由查询", "是否追加日期": "1", "保留原文件名": "1",
+            "报表库选择": "1 -- 报表库", "报表类型": "3 -- 月",
+            "起始日期": "202601", "终止日期": "202603",
+            "国库选择": "", "辖属标志": "0 -- 全辖",
+            "国库属性": "0 -- 全部", "预算级次": "0",
+            "会计科目": "271,272,273", "会计账户名称": "ALL",
+            "计划单列市/县/乡": "0 -- 不含", "展示范围": "1 -- 下级", "金额单位": "0 -- 元",
+            "分序时": "1", "分地区": "0", "分国库属性": "0", "分预算级次": "1",
+            "分会计科目": "1", "分会计账户": "1", "是否展示同比": "0",
         },
     },
 }
@@ -317,7 +355,7 @@ class TMISAutoApp(tk.Tk):
 
         ttk.Label(header, text="TMIS  数据自由查询批量抓取工具",
                   style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header, text="v5.1   |   收入 / 支出 / 退库 自动填表 / 查询 / 导出 / 清洗",
+        ttk.Label(header, text="v5.1   |   收入 / 支出 / 退库 / 库存 自动填表 / 查询 / 导出 / 清洗",
                   style="Subtitle.TLabel").pack(side=tk.LEFT, padx=(16, 0), pady=(8, 0))
 
         # ============ 文件选择卡片 ============
@@ -718,7 +756,7 @@ class TMISAutoApp(tk.Tk):
                     tasks.append((current_sz_type, row))
                     
             if not tasks:
-                self.log("未在Excel中找到有效的任务数据 (请检查Sheet名称是否包含'收入'/'支出'/'退库')", "ERROR")
+                self.log("未在Excel中找到有效的任务数据 (请检查Sheet名称是否包含'收入'/'支出'/'退库'/'库存')", "ERROR")
                 return
                 
             total = len(tasks)
@@ -929,7 +967,7 @@ class TMISAutoApp(tk.Tk):
         智能导航侧边栏。根据数据类型动态拼接目标菜单。
         如果当前已经导航到同一类型，跳过。
 
-        导航路径：固定报表 -> 数据自由查询 -> {收入/支出/退库}数据自由查询
+        导航路径：固定报表 -> 数据自由查询 -> {收入/支出/退库/库存}数据自由查询
         """
         config = REPORT_CONFIGS[sz_type]
         menu_title = config["menu_title"]
@@ -1004,7 +1042,7 @@ class TMISAutoApp(tk.Tk):
         Args:
             page: Playwright Page 对象
             row: Excel 数据行
-            sz_type: "收入" 或 "支出"
+            sz_type: "收入"、"支出"、"退库" 或 "库存"
         """
         self.log("  开始填充表单...")
         config = REPORT_CONFIGS[sz_type]
@@ -1214,7 +1252,7 @@ class TMISAutoApp(tk.Tk):
         """
         self.log("  准备导出数据...")
 
-        # 切入帆软报表 iframe（收入6010，支出6020，退库6030）
+        # 切入帆软报表 iframe（收入6010，支出6020，退库6030，库存6040）
         iframe_name = REPORT_CONFIGS[sz_type]["iframe_name"]
         iframe = page.frame_locator(f'iframe[name="{iframe_name}"]')
 
@@ -1259,6 +1297,30 @@ class TMISAutoApp(tk.Tk):
 
         if ws.max_row is None or ws.max_row < 2:
             self.log("  导出文件为空，跳过后处理", "WARN")
+            wb.close()
+            return
+
+        if sz_type == "库存":
+            stock_city_col = None
+            for c in range(1, ws.max_column + 1):
+                header = str(ws.cell(row=1, column=c).value or "").strip()
+                if header == "所属市国库代码":
+                    stock_city_col = c
+                    break
+
+            if stock_city_col is None:
+                self.log("    未找到'所属市国库代码'列，库存专用清理跳过", "INFO")
+            else:
+                ws.delete_cols(stock_city_col, 1)
+                self.log(f"    已删除库存报表'所属市国库代码'列（原第{stock_city_col}列）", "SUCCESS")
+
+            try:
+                wb.save(file_path)
+                self.log("  库存数据后处理完成，已覆盖保存（格式已保留）", "SUCCESS")
+            except Exception as e:
+                self.log(f"  保存库存后处理文件失败: {e}", "ERROR")
+            finally:
+                wb.close()
             return
 
         bdg_level = str(row.get("pBdgLevel", "")).strip()
@@ -1335,7 +1397,7 @@ class TMISAutoApp(tk.Tk):
 # Excel参数模板生成
 # ============================================================================
 def generate_template(output_path: str = "TMIS数据自由查询参数模板_v5.1.xlsx"):
-    """生成数据自由查询参数模板（分收入/支出/退库 Sheet，全中文表头）"""
+    """生成数据自由查询参数模板（分收入/支出/退库/库存 Sheet，全中文表头）"""
     with pd.ExcelWriter(output_path) as writer:
         for report_type, config in REPORT_CONFIGS.items():
             columns = config["template_columns"]
