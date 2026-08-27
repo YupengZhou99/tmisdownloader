@@ -1,0 +1,9 @@
+# Runtime dependency. 5.9.8 publishes a CPython 3.7+ Windows x86 wheel
+# and still classifies Windows 7 as supported.
+psutil==5.9.8
+
+# Build toolchain pinned for Python 3.8 and legacy Windows compatibility.
+pyinstaller==4.10
+pyinstaller-hooks-contrib==2022.4
+pefile==2021.9.3
+altgraph==0.17.2

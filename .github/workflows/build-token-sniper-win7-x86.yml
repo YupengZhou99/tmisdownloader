@@ -1,0 +1,81 @@
+name: Build Token Sniper - Windows 7 x86
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "TMIS登录Token捕获工具_Win7_32位.py"
+      - "requirements-token-sniper-win7-x86.txt"
+      - "tests/test_token_sniper_core.py"
+      - "TOKEN捕获工具_Win7_32位说明.md"
+      - ".github/workflows/build-token-sniper-win7-x86.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Python 3.8.10 x86 - PyInstaller 4.10
+    runs-on: windows-2022
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.8.10 x86
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8.10"
+          architecture: "x86"
+
+      - name: Verify 32-bit interpreter
+        run: >-
+          python -c "import struct, sys;
+          bits = struct.calcsize('P') * 8;
+          print(sys.version); print('Python architecture:', bits);
+          assert bits == 32, 'Expected 32-bit Python'"
+
+      - name: Install pinned legacy-compatible toolchain
+        run: |
+          python -m pip install --upgrade "pip==24.0" "setuptools==65.7.0" "wheel==0.42.0"
+          python -m pip install -r requirements-token-sniper-win7-x86.txt
+
+      - name: Run core tests
+        run: python -m unittest discover -s tests -p "test_token_sniper_core.py" -v
+
+      - name: Build single-file GUI executable
+        run: >-
+          python -m PyInstaller
+          --clean
+          --noconfirm
+          --onefile
+          --windowed
+          --noupx
+          --name "TMIS-Token-Sniper-Win7-x86"
+          --hidden-import tkinter
+          --hidden-import tkinter.ttk
+          --hidden-import tkinter.scrolledtext
+          --hidden-import psutil._psutil_windows
+          "TMIS登录Token捕获工具_Win7_32位.py"
+
+      - name: Verify executable PE architecture
+        shell: pwsh
+        run: |
+          $exe = "dist/TMIS-Token-Sniper-Win7-x86.exe"
+          python -c "import pathlib, struct; p=pathlib.Path(r'$exe'); data=p.read_bytes(); pe=struct.unpack_from('<I', data, 0x3C)[0]; machine=struct.unpack_from('<H', data, pe+4)[0]; print('PE machine: 0x%04X' % machine); assert machine == 0x014C, 'Expected PE32 x86 executable'"
+
+      - name: Copy usage guide
+        shell: pwsh
+        run: Copy-Item "TOKEN捕获工具_Win7_32位说明.md" dist\
+
+      - name: Upload Windows 7 x86 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMIS-Token-Sniper-Win7-x86
+          path: |
+            dist/TMIS-Token-Sniper-Win7-x86.exe
+            dist/TOKEN捕获工具_Win7_32位说明.md
+          retention-days: 30
+          if-no-files-found: error
