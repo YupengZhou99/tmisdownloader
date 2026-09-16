@@ -6,6 +6,7 @@ on:
       - main
       - master
       - "codex/**"
+      - "!codex/kylin-*"  # 麒麟分支由独立 Linux 工作流打包。
   workflow_dispatch:          # 支持手动在 Actions 页面触发
 
 jobs:

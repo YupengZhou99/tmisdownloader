@@ -1,0 +1,20 @@
+# Kylin V10 SP1 / glibc 2.31 baseline. Separate from the Windows build.
+playwright==1.49.0
+greenlet==3.1.1
+pyee==12.0.0
+typing_extensions==4.12.2
+numpy==1.26.4
+pandas==2.2.3
+python-dateutil==2.9.0.post0
+pytz==2024.2
+tzdata==2024.2
+six==1.17.0
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+psutil==6.1.1
+pyperclip==1.9.0
+pyinstaller==6.11.1
+pyinstaller-hooks-contrib==2024.10
+altgraph==0.17.4
+packaging==24.2
+setuptools==75.6.0

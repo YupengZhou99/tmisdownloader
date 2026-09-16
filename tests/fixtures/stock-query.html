@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>TMIS local fixture</title>
+<style>
+  .el-form-item { display: inline-block; width: 330px; margin: 8px; }
+  .el-select-dropdown { background: white; border: 1px solid gray; }
+  label.el-checkbox { display: inline-block; margin: 8px; }
+  .el-input__inner { width: 220px; }
+</style>
+<nav><span>固定报表</span> / <span>数据自由查询</span> / <span>库存数据自由查询</span></nav>
+<main id="fields"></main>
+<div id="checkboxes"></div>
+<button class="el-button" onclick="query()">查询</button>
+<form id="reportForm" action="/report" method="post" target="fineReportTsasRpt6040" style="display:none">
+  <input name="serial" id="serial" value="0">
+  <input name="mode" id="mode" value="normal">
+</form>
+<iframe name="fineReportTsasRpt6040" src="/report?serial=0" style="width:100%;height:120px"></iframe>
+<script>
+const selects = [
+  ['pRptDbType', '报表库选择', ['1 -- 报表库', '0 -- 预处理库']],
+  ['pRptType', '报表类型', ['1 -- 日', '2 -- 旬', '3 -- 月', '4 -- 季', '5 -- 年']],
+  ['pGovernFlag', '辖属标志', ['0 -- 全辖', '1 -- 本级']],
+  ['pTreAttrib', '国库属性', ['0 -- 全部', '1 -- 人行经理', '2 -- 商行代理']],
+  ['pSigTreArea', '计划单列市/县/乡', ['0 -- 不含', '1 -- 包含']],
+  ['pShowScope', '展示范围', ['0 -- 全部', '1 -- 下级']],
+  ['pAmtUnit', '金额单位', ['0 -- 元', '2 -- 万元']],
+];
+for (const [id, label, options] of selects) {
+  const field = document.createElement('div');
+  field.className = 'el-form-item';
+  field.innerHTML = '<label for="' + id + '">' + label + '</label><div class="el-select"><input class="el-input__inner" readonly><ul class="el-select-dropdown" style="display:none"></ul></div>';
+  const input = field.querySelector('input'), menu = field.querySelector('ul');
+  input.value = options[0];
+  input.onclick = () => { menu.style.display = 'block'; };
+  for (const value of options) {
+    const item = document.createElement('li');
+    item.className = 'el-select-dropdown__item';
+    item.textContent = value;
+    item.onclick = () => { input.value = value; menu.style.display = 'none'; };
+    menu.append(item);
+  }
+  document.getElementById('fields').append(field);
+}
+for (const [id, label] of [
+  ['pStartDate', '起始日期'], ['pEndDate', '终止日期'], ['pTreCode', '国库选择'],
+  ['pBdgLevel', '预算级次'], ['pBookSbt', '会计科目'], ['pBookAcctName', '会计账户名称'],
+]) {
+  const field = document.createElement('div');
+  field.className = 'el-form-item';
+  field.innerHTML = '<label for="' + id + '">' + label + '</label><div class="el-input ' + (id.includes('Date') ? 'el-date-editor' : '') + '"><input class="el-input__inner"></div>';
+  document.getElementById('fields').append(field);
+}
+for (const label of ['分序时', '分地区', '分国库属性', '分预算级次', '分会计科目', '分会计账户', '是否展示同比']) {
+  const checkbox = document.createElement('label');
+  checkbox.className = 'el-checkbox';
+  checkbox.textContent = label;
+  checkbox.onclick = () => checkbox.classList.toggle('is-checked');
+  document.getElementById('checkboxes').append(checkbox);
+}
+window.queryMode = 'normal';
+function query() {
+  if (window.queryMode === 'no-navigation') return;
+  document.getElementById('serial').value = Number(document.getElementById('serial').value) + 1;
+  document.getElementById('mode').value = window.queryMode;
+  document.getElementById('reportForm').submit();
+}
+</script>
+</html>

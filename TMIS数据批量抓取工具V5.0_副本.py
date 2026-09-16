@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TMIS数据自由查询批量抓取工具 v5.1
+TMIS数据自由查询批量抓取工具 v5.2
 ===========================
 使用 Playwright 自动启动系统 Chrome 浏览器，携 Token 登录内网系统，
 自动填表、查询、导出报表，并可选数据后处理。
@@ -25,8 +25,10 @@ import sys
 import os
 import re
 import threading
+import csv
+import tempfile
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox
+from tkinter import ttk, filedialog, scrolledtext, messagebox, simpledialog
 import pandas as pd
 from openpyxl import load_workbook
 from datetime import datetime
@@ -37,6 +39,11 @@ import asyncio
 
 # Playwright
 from playwright.async_api import async_playwright, Page
+from tmis_runtime import (
+    browser_environment, browser_launch_options, bundled_browser_path,
+    normalize_query_date, normalize_task_row, option_matches,
+    redact_urls, validate_login_url,
+)
 
 # URL 狙击手所需
 try:
@@ -250,7 +257,7 @@ class TMISAutoApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("TMIS  数据自由查询批量抓取工具 v5.1")
+        self.title("TMIS  数据自由查询批量抓取工具 v5.2")
         self.geometry("980x820")
         self.resizable(True, True)
         self.configure(bg=self.BG_PRIMARY)
@@ -258,10 +265,17 @@ class TMISAutoApp(tk.Tk):
 
         # 初始化变量
         self.excel_path = tk.StringVar()
+        packaged_parameters = os.path.join(
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__)),
+            "江苏库存自由查询_202501-202608_14库280任务.xlsx",
+        )
+        if os.path.isfile(packaged_parameters):
+            self.excel_path.set(packaged_parameters)
         self.download_folder = tk.StringVar()
         self.worker_thread = None
         self.sniper_thread = None
         self.is_running = False
+        self._active_browser = None
 
         # URL 狙击手捕获到的登录链接
         self.target_url = None
@@ -357,7 +371,7 @@ class TMISAutoApp(tk.Tk):
 
         ttk.Label(header, text="TMIS  数据自由查询批量抓取工具",
                   style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header, text="v5.1   |   收入 / 支出 / 退库 / 库存 自动填表 / 查询 / 导出 / 清洗",
+        ttk.Label(header, text="v5.2   |   收入 / 支出 / 退库 / 库存 自动填表 / 查询 / 导出 / 清洗",
                   style="Subtitle.TLabel").pack(side=tk.LEFT, padx=(16, 0), pady=(8, 0))
 
         # ============ 文件选择卡片 ============
@@ -409,7 +423,7 @@ class TMISAutoApp(tk.Tk):
         row4 = ttk.Frame(card, style="Card.TFrame")
         row4.pack(fill=tk.X, pady=(10, 0))
 
-        ttk.Label(row4, text="Chrome路径", style="Card.TLabel", width=10).pack(side=tk.LEFT)
+        ttk.Label(row4, text="浏览器路径", style="Card.TLabel", width=10).pack(side=tk.LEFT)
         tk.Entry(row4, textvariable=self.chrome_path_var,
                  bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
                  font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0
@@ -453,11 +467,18 @@ class TMISAutoApp(tk.Tk):
         )
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
 
+        self.login_btn = self._make_btn(
+            btn_bar, "粘贴登录链接", self._paste_login_url,
+            self.BG_INPUT, "#1a5276", width=12
+        )
+        self.login_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         self.sniper_btn = self._make_btn(
             btn_bar, "  捕获登录链接  ", self._start_sniper,
             self.CLR_BLUE, self.CLR_HOVER_B, width=16
         )
-        self.sniper_btn.pack(side=tk.RIGHT)
+        if not sys.platform.startswith("linux"):
+            self.sniper_btn.pack(side=tk.RIGHT)
 
         # ============ 日志区域 ============
         log_header = ttk.Frame(container, style="Main.TFrame")
@@ -513,6 +534,7 @@ class TMISAutoApp(tk.Tk):
 
     def log(self, msg: str, level: str = "INFO"):
         """线程安全的日志输出"""
+        msg = redact_urls(msg)
         def _append():
             self.log_text.config(state=tk.NORMAL)
             ts = datetime.now().strftime("%H:%M:%S")
@@ -522,12 +544,30 @@ class TMISAutoApp(tk.Tk):
             self.log_text.config(state=tk.DISABLED)
         self.after(0, _append)
 
+    def _paste_login_url(self):
+        value = simpledialog.askstring(
+            "登录链接", "粘贴本次有效的完整登录链接（仅存于内存）：",
+            parent=self, show="*",
+        )
+        if value is None:
+            return
+        try:
+            self.target_url = validate_login_url(value)
+        except ValueError as error:
+            messagebox.showerror("登录链接无效", str(error), parent=self)
+            return
+        self.log("登录链接已设置，请点击「开始批量执行」", "SUCCESS")
+
     # ========================================================================
     # 需求1：URL 狙击手 —— 捕获 Token 链接 + 全自动启动
     # ========================================================================
     def _start_sniper(self):
         """启动 URL 狙击手守护线程"""
         global sniper_flag
+
+        if sys.platform.startswith("linux"):
+            self._paste_login_url()
+            return
 
         if psutil is None:
             messagebox.showerror("缺少依赖", "请先安装 psutil: pip install psutil")
@@ -561,7 +601,7 @@ class TMISAutoApp(tk.Tk):
 
         # 记录启动前已有的浏览器进程 PID，避免误杀
         browser_names = {"chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe",
-                         "chrome", "msedge", "firefox"}
+                         "chrome", "msedge", "firefox", "chromium", "chromium-browser"}
         known_pids = set()
         for proc in psutil.process_iter(["pid", "name"]):
             try:
@@ -619,9 +659,6 @@ class TMISAutoApp(tk.Tk):
         if captured_url:
             self.target_url = captured_url
             self.log("Token 链接捕获成功!", "SUCCESS")
-            # 只显示前100个字符，避免日志过长
-            display_url = captured_url if len(captured_url) <= 100 else captured_url[:100] + "..."
-            self.log(f"链接: {display_url}", "SUCCESS")
 
             # 同时复制到剪贴板（备用）
             try:
@@ -663,18 +700,31 @@ class TMISAutoApp(tk.Tk):
             messagebox.showerror("错误", "请选择有效的下载保存文件夹")
             return
 
-        # 必须先捕获到 Token 链接
+        if self.is_running:
+            return
+
+        # 支持捕获或手动粘贴的 Token 链接。
         if not self.target_url:
             messagebox.showwarning("提示",
-                "尚未捕获到登录链接。\n\n"
-                "请先点击「捕获登录链接」，然后在客户端触发系统登录。")
+                "请先点击「粘贴登录链接」，或通过「捕获登录链接」获取本次登录地址。")
             return
 
         stop_flag = False
         self.current_nav_type = None  # 重置导航状态
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+        self.login_btn.config(state=tk.DISABLED)
+        self.sniper_btn.config(state=tk.DISABLED)
         self.is_running = True
+
+        # Tk 变量只在主线程读取，后台使用本次执行快照。
+        self.run_options = {
+            "browser_path": self.chrome_path_var.get().strip(),
+            "start_date": self.start_date_var.get().strip(),
+            "end_date": self.end_date_var.get().strip(),
+            "postprocess": self.enable_postprocess.get(),
+            "naming_mode": self.naming_mode.get(),
+        }
 
         self.log("=" * 50, "SUCCESS")
         self.log("批量任务开始执行", "SUCCESS")
@@ -687,14 +737,15 @@ class TMISAutoApp(tk.Tk):
 
     def _stop_task(self):
         """停止任务"""
-        global stop_flag
+        global stop_flag, sniper_flag
         stop_flag = True
+        sniper_flag = True
         self.log("用户请求停止任务...", "WARN")
 
     def _worker(self, excel_file: str, dl_folder: str):
         """后台工作线程"""
         try:
-            asyncio.run(self._run_automation(excel_file, dl_folder))
+            asyncio.run(self._run_with_stop(excel_file, dl_folder))
         except Exception as e:
             self.log(f"任务执行出错: {e}", "ERROR")
             self.log(traceback.format_exc(), "ERROR")
@@ -702,9 +753,26 @@ class TMISAutoApp(tk.Tk):
             self.is_running = False
             self.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             self.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+            self.after(0, lambda: self.login_btn.config(state=tk.NORMAL))
+            self.after(0, lambda: self.sniper_btn.config(state=tk.NORMAL))
             self.log("=" * 50, "SUCCESS")
-            self.log("全部任务执行完毕", "SUCCESS")
+            self.log("本次执行已结束，请查看执行汇总及下载结果清单", "INFO")
             self.log("=" * 50, "SUCCESS")
+
+    async def _run_with_stop(self, excel_file, dl_folder):
+        """停止时关闭本次浏览器，让在途查询和下载及时返回。"""
+        work = asyncio.create_task(self._run_automation(excel_file, dl_folder))
+        try:
+            while not work.done():
+                if stop_flag and self._active_browser is not None:
+                    await self._active_browser.close()
+                    break
+                await asyncio.sleep(0.2)
+            await work
+        finally:
+            if self._active_browser is not None:
+                await self._active_browser.close()
+                self._active_browser = None
 
     # ========================================================================
     # 核心自动化逻辑（异步）
@@ -744,6 +812,8 @@ class TMISAutoApp(tk.Tk):
                     df_sheet.rename(columns=new_columns, inplace=True)
                 
                 for _, row in df_sheet.iterrows():
+                    if not any(str(value).strip() for value in row):
+                        continue
                     # 如果行内本身有“收支类型/数据类型”则优先（兼容老模板）
                     row_sz = str(row.get("收支类型", row.get("数据类型", ""))).strip()
                     if row_sz in REPORT_CONFIGS:
@@ -755,7 +825,10 @@ class TMISAutoApp(tk.Tk):
                         self.log(f"跳过暂不支持的任务类型: {current_sz_type}", "WARN")
                         continue
                         
-                    tasks.append((current_sz_type, row))
+                    for field, fallback in (("pStartDate", "start_date"), ("pEndDate", "end_date")):
+                        if not str(row.get(field, "")).strip():
+                            row[field] = self.run_options[fallback]
+                    tasks.append((current_sz_type, normalize_task_row(row)))
                     
             if not tasks:
                 self.log("未在Excel中找到有效的任务数据 (请检查Sheet名称是否包含'收入'/'支出'/'退库'/'库存')", "ERROR")
@@ -768,32 +841,29 @@ class TMISAutoApp(tk.Tk):
             return
 
         # ---- 2. 启动全新浏览器并携 Token 登录 ----
-        self.log("正在启动系统 Chrome 浏览器 (有头模式)...")
+        self.log("正在启动 Chrome/Chromium 浏览器 (有头模式)...")
         async with async_playwright() as pw:
             try:
                 launch_kwargs = {
                     "headless": False,
-                    "channel": "chrome",
+                    "env": browser_environment(),
                     "args": [
                         "--ignore-certificate-errors",
                         "--ignore-ssl-errors",
-                        "--disable-web-security",
                         "--no-first-run",
                         "--disable-popup-blocking",
                         "--start-maximized",
                     ]
                 }
-                chrome_path = self.chrome_path_var.get().strip()
-                if chrome_path and os.path.exists(chrome_path):
-                    launch_kwargs.pop("channel", None)
-                    launch_kwargs["executable_path"] = chrome_path
-                    self.log(f"使用手动指定的 Chrome: {chrome_path}")
-                else:
-                    self.log("自动检测系统 Chrome (channel=chrome)")
+                launch_kwargs.update(browser_launch_options(
+                    self.run_options["browser_path"], bundled_browser_path(),
+                ))
+                self.log("浏览器: " + launch_kwargs.get("executable_path", "系统 Chrome"))
                 browser = await pw.chromium.launch(**launch_kwargs)
+                self._active_browser = browser
             except Exception as e:
                 self.log(f"启动浏览器失败: {e}", "ERROR")
-                self.log("请确保已安装 Playwright 浏览器: playwright install chromium", "WARN")
+                self.log("请填写可用浏览器路径，或完整解压附带 browser 目录的 Linux 包。", "WARN")
                 return
 
             self.log("浏览器启动成功", "SUCCESS")
@@ -809,20 +879,28 @@ class TMISAutoApp(tk.Tk):
             # 携 Token 直达内网主页
             self.log(f"正在携 Token 访问内网系统...")
             try:
-                await page.goto(self.target_url, wait_until="networkidle", timeout=60000)
-                self.log("内网系统登录成功!", "SUCCESS")
+                await page.goto(self.target_url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
-                # 有些内网页面 networkidle 可能超时但实际已加载
+                if stop_flag:
+                    return
                 self.log(f"页面加载提示: {e}", "WARN")
-                self.log("继续执行...", "INFO")
-
-            # 等待页面完全稳定
-            await asyncio.sleep(3)
+            try:
+                await page.get_by_text("固定报表", exact=True).first.wait_for(state="visible", timeout=30000)
+            except Exception:
+                if not stop_flag:
+                    self.log("未进入 TMIS 工作界面。请检查内网连接和登录链接是否已过期，重新粘贴有效 URL 后再试。", "ERROR")
+                return
+            self.log("已进入 TMIS 工作界面，开始执行报表任务", "SUCCESS")
 
             # ---- 3. 循环处理每一行任务 ----
             success_count = 0
             fail_count = 0
             name_counter = {}
+            result_path = os.path.join(dl_folder, "下载结果_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".csv")
+            result_fields = ["序号", "类型", "文件名称", "国库选择", "起始日期", "终止日期", "展示范围", "状态", "错误"]
+            with open(result_path, "w", encoding="utf-8-sig", newline="") as stream:
+                csv.DictWriter(stream, fieldnames=result_fields).writeheader()
+            self.log("本次逐条执行结果将保存到: " + result_path)
 
             for idx, (sz_type, row) in enumerate(tasks):
                 if stop_flag:
@@ -830,6 +908,11 @@ class TMISAutoApp(tk.Tk):
                     break
 
                 dynamic_name = self._build_filename(row, sz_type, name_counter)
+                result = dict(zip(result_fields, [
+                    idx + 1, sz_type, dynamic_name, row.get("pTreCode", ""),
+                    row.get("pStartDate", ""), row.get("pEndDate", ""),
+                    row.get("pShowScope", ""), "失败", "",
+                ]))
 
                 self.log(f"\n{'─' * 45}")
                 self.log(f"▶ 第 {idx + 1}/{total} 条任务 [{sz_type}]: {dynamic_name}")
@@ -849,23 +932,34 @@ class TMISAutoApp(tk.Tk):
                         page, dl_folder, dynamic_name, sz_type, keep_original_name
                     )
 
-                    if self.enable_postprocess.get() and saved_path and os.path.exists(saved_path):
+                    if self.run_options["postprocess"] and saved_path and os.path.exists(saved_path):
                         self._process_excel_data(saved_path, row, sz_type)
-                    elif not self.enable_postprocess.get():
+                    elif not self.run_options["postprocess"]:
                         self.log("  数据后处理已关闭，跳过", "INFO")
 
                     success_count += 1
+                    result["状态"] = "成功"
                     self.log(f"任务完成: {dynamic_name}", "SUCCESS")
 
                 except Exception as e:
+                    result["错误"] = redact_urls(e)
+                    if stop_flag:
+                        result["状态"] = "已停止"
+                        break
                     fail_count += 1
                     self.log(f"任务失败: {e}", "ERROR")
                     self.log(traceback.format_exc(), "ERROR")
+                    # 错误后关闭该标签，下一条重新打开，清除半填表单和旧报表。
+                    await self._close_current_tab(page, sz_type)
+                    self.current_nav_type = None
+                finally:
+                    with open(result_path, "a", encoding="utf-8", newline="") as stream:
+                        csv.DictWriter(stream, fieldnames=result_fields).writerow(result)
 
                 await asyncio.sleep(2)
 
             # ---- 4. 汇总 ----
-            self.log(f"\n执行汇总: 共 {total} 条, 成功 {success_count} 条, 失败 {fail_count} 条",
+            self.log(f"\n执行汇总: 共 {total} 条, 成功 {success_count} 条, 失败 {fail_count} 条, 未完成 {total - success_count - fail_count} 条",
                      "SUCCESS" if fail_count == 0 else "WARN")
 
             # ---- 5. 清理浏览器 ----
@@ -887,12 +981,12 @@ class TMISAutoApp(tk.Tk):
         start_date = str(row.get("pStartDate", "")).strip()
         end_date = str(row.get("pEndDate", "")).strip()
         if not start_date:
-            start_date = self.start_date_var.get().strip()
+            start_date = self.run_options["start_date"]
         if not end_date:
-            end_date = self.end_date_var.get().strip()
+            end_date = self.run_options["end_date"]
 
         # 模式1：参数表命名
-        if self.naming_mode.get() == "param":
+        if self.run_options["naming_mode"] == "param":
             custom_name = str(row.get("文件名称", "")).strip()
             if custom_name:
                 append_date = str(row.get("是否追加日期", "1")).strip().lower()
@@ -1058,8 +1152,8 @@ class TMISAutoApp(tk.Tk):
 
         # ---- 日期字段（Excel 优先，UI 后备） ----
         ui_dates = {
-            "pStartDate": self.start_date_var.get().strip(),
-            "pEndDate": self.end_date_var.get().strip(),
+            "pStartDate": self.run_options["start_date"],
+            "pEndDate": self.run_options["end_date"],
         }
         for field_id in config["date_fields"]:
             val = str(row.get(field_id, "")).strip()
@@ -1067,7 +1161,7 @@ class TMISAutoApp(tk.Tk):
                 val = ui_dates.get(field_id, "")
             if not val:
                 continue
-            await self._fill_date(page, field_id, val)
+            await self._fill_date(page, field_id, normalize_query_date(val, row.get("pRptType", "")))
 
         # ---- 文本输入字段 ----
         for field_id in config["text_fields"]:
@@ -1089,6 +1183,8 @@ class TMISAutoApp(tk.Tk):
         for cb_name in REPORT_CONFIGS[sz_type]["checkbox_fields"]:
             val = str(row.get(cb_name, "")).strip()
             if val:
+                if val not in ("0", "1"):
+                    raise ValueError(f"复选框 {cb_name} 只能填 0 或 1，收到 {val}")
                 await self._set_checkbox(page, cb_name, int(val))
 
 
@@ -1113,7 +1209,10 @@ class TMISAutoApp(tk.Tk):
         await inp.type(value, delay=50)
         await asyncio.sleep(0.2)
         await inp.press("Enter")
+        await inp.press("Tab")
         await asyncio.sleep(0.5)
+        if (await inp.input_value()).strip() != value:
+            raise ValueError(f"日期 {field_id} 未被页面接受，请检查报表类型和日期格式")
 
     async def _fill_text_input(self, page: Page, field_id: str, value: str):
         """填充文本输入框，填入后 Enter + Tab 触发 Vue 绑定"""
@@ -1158,26 +1257,14 @@ class TMISAutoApp(tk.Tk):
             item_text = (await item.text_content() or "").strip()
 
             # 匹配：精确匹配 / 前缀匹配（如 "0" 匹配 "0 -- 全辖"）
-            if (item_text == value
-                    or item_text.startswith(f"{value} ")
-                    or item_text.startswith(f"{value}--")):
+            if option_matches(value, item_text):
                 await item.click()
                 found = True
                 break
 
         if not found:
-            # 兜底：has-text 模糊匹配
-            try:
-                await page.locator(
-                    f".el-select-dropdown__item:visible:has-text('{value}')"
-                ).first.click()
-                found = True
-            except Exception:
-                pass
-
-        if not found:
-            self.log(f"    下拉选项 '{value}' 未找到，跳过", "WARN")
             await page.keyboard.press("Escape")
+            raise ValueError(f"下拉字段 {field_id} 中不存在选项 {value}，本条不执行查询")
 
         await asyncio.sleep(0.3)
 
@@ -1185,13 +1272,14 @@ class TMISAutoApp(tk.Tk):
         """设置复选框状态（通过 is-checked 类判断）"""
         self.log(f"    复选框 '{label_text}' -> {'勾选' if target == 1 else '取消'}")
 
-        cb_locator = page.locator(f"label.el-checkbox:visible:has-text('{label_text}')").first
+        cb_locator = page.locator("label.el-checkbox:visible").filter(
+            has_text=re.compile(r"^\s*" + re.escape(label_text) + r"\s*$")
+        ).first
 
         try:
             await cb_locator.wait_for(state="visible", timeout=5000)
-        except Exception:
-            self.log(f"    复选框 '{label_text}' 未找到（当前数据类型可能无此字段），跳过", "WARN")
-            return
+        except Exception as error:
+            raise ValueError(f"页面缺少已指定的复选框: {label_text}") from error
 
         class_attr = await cb_locator.get_attribute("class") or ""
         is_checked = "is-checked" in class_attr
@@ -1203,39 +1291,42 @@ class TMISAutoApp(tk.Tk):
     # ========================================================================
     # 查询等待：检测"原样导出"按钮可用状态
     # ========================================================================
-    async def _click_query_and_wait(self, page: Page, sz_type: str = "收入"):
-        """点击查询按钮，等待"原样导出"按钮 ui-state-enabled。超时6分钟。"""
+    async def _click_query_and_wait(self, page: Page, sz_type: str = "收入", timeout_seconds=360):
+        """先等本次 form POST 导致 iframe 导航，再等新报表的导出按钮。"""
         self.log("  点击查询按钮...")
-
+        iframe_name = REPORT_CONFIGS[sz_type]["iframe_name"]
         query_btn = page.locator("button.el-button:visible:has-text('查询')").first
         await query_btn.wait_for(state="visible", timeout=5000)
-        await query_btn.click()
+        deadline = time.monotonic() + timeout_seconds
+        # 提供的页面使用 form[target=fineReportTsasRpt6040] 提交新报表。
+        # 只看 ui-state-enabled 会误把前一条任务仍可用的按钮当作新结果。
+        async with page.expect_event(
+            "framenavigated", predicate=lambda frame: frame.name == iframe_name,
+            timeout=timeout_seconds * 1000,
+        ):
+            await query_btn.click()
 
-        self.log("  等待数据查询完成（检测'原样导出'按钮状态，最长6分钟）...")
-        await asyncio.sleep(3)
-
-        iframe_name = REPORT_CONFIGS[sz_type]["iframe_name"]
-        self.log(f"  使用 iframe: {iframe_name}")
+        self.log("  本次报表已开始加载，等待原样导出可用...")
         iframe = page.frame_locator(f'iframe[name="{iframe_name}"]')
         export_indicator = iframe.locator('.fr-btn[widgetname="ExcelO"]')
-
-        max_wait, poll_interval, elapsed = 360, 2, 0
-        while elapsed < max_wait:
+        last_log = time.monotonic()
+        while time.monotonic() < deadline:
+            if stop_flag:
+                raise InterruptedError("用户已停止任务")
             try:
-                class_attr = await export_indicator.get_attribute("class", timeout=5000)
+                class_attr = await export_indicator.get_attribute(
+                    "class", timeout=max(1, min(2000, int((deadline - time.monotonic()) * 1000))),
+                )
                 if class_attr and "ui-state-enabled" in class_attr:
                     self.log("  数据查询完成，导出按钮已可用", "SUCCESS")
-                    await asyncio.sleep(1)
                     return
             except Exception:
                 pass
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-            if elapsed % 30 == 0:
-                self.log(f"  仍在等待数据加载... ({elapsed}秒)", "INFO")
-
-        self.log("  等待导出按钮可用超时（6分钟），继续尝试导出...", "WARN")
-        await asyncio.sleep(1)
+            await asyncio.sleep(min(0.5, max(0, deadline - time.monotonic())))
+            if time.monotonic() - last_log >= 30:
+                self.log("  仍在等待本次报表加载...", "INFO")
+                last_log = time.monotonic()
+        raise TimeoutError("本次查询超时，本条不导出，避免保存前一条报表")
 
     # ========================================================================
     # 需求2：强力导出（force=True 穿透透明遮挡层）
@@ -1279,7 +1370,16 @@ class TMISAutoApp(tk.Tk):
             new_filename = f"{dynamic_name}{ext}"
         save_path = os.path.join(dl_folder, new_filename)
 
-        await download.save_as(save_path)
+        fd, temp_path = tempfile.mkstemp(prefix=".tmis-", suffix=".part", dir=dl_folder)
+        os.close(fd)
+        try:
+            await download.save_as(temp_path)
+            if await download.failure() or os.path.getsize(temp_path) == 0:
+                raise IOError("下载失败或文件为空")
+            os.replace(temp_path, save_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
         self.log(f"  文件已保存: {new_filename}", "SUCCESS")
 
         return save_path
@@ -1471,24 +1571,57 @@ def main():
         generate_template(out)
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-check":
+        run_self_check()
+        return
+
     app = TMISAutoApp()
 
-    app.log("TMIS 数据自由查询批量抓取工具 v5.1 就绪", "SUCCESS")
+    app.log("TMIS 数据自由查询批量抓取工具 v5.2 就绪", "SUCCESS")
     app.log("")
     app.log("全自动使用步骤")
     app.log("  1  选择 Excel 参数模板")
     app.log("  2  选择下载保存目录")
     app.log("  3  设置日期、命名模式、是否启用后处理")
-    app.log("  4  点击「捕获登录链接」")
-    app.log("  5  在客户端触发系统登录")
-    app.log("  6  程序自动拦截 Token -> 启动 Chrome -> 执行全部任务")
+    app.log("  4  点击「粘贴登录链接」，输入本次有效的完整 URL")
+    app.log("  5  点击「开始批量执行」")
+    app.log("  6  程序打开 Chrome/Chromium 登录并执行任务")
     app.log("")
-    app.log("无需手动打开浏览器，自动检测系统 Chrome，全程零操作", "SUCCESS")
+    app.log("参数表日期优先；Linux 可自动使用随包附带的 Chromium。", "INFO")
 
     try:
         app.mainloop()
     except KeyboardInterrupt:
         pass
+
+
+def run_self_check():
+    """在 CI 虚拟桌面验证打包后的 Tk 和 Playwright，不访问 TMIS。"""
+    import json
+    import platform
+    app = TMISAutoApp()
+    app.withdraw()
+    app.update()
+    if sys.platform.startswith("linux"):
+        assert not app.sniper_btn.winfo_manager()
+    assert callable(app._paste_login_url)
+    app.destroy()
+
+    async def check_browser():
+        async with async_playwright() as pw:
+            browser_path = bundled_browser_path()
+            if not browser_path.is_file():
+                browser_path = pw.chromium.executable_path
+            browser = await pw.chromium.launch(
+                executable_path=str(browser_path), headless=True, env=browser_environment(),
+            )
+            page = await browser.new_page()
+            await page.set_content("<title>TMIS packaging check</title><p>库存自由查询</p>")
+            assert await page.title() == "TMIS packaging check"
+            await browser.close()
+
+    asyncio.run(check_browser())
+    print(json.dumps({"status": "ok", "version": "5.2", "machine": platform.machine(), "libc": platform.libc_ver(), "checks": ["Tk GUI", "manual URL entry", "Playwright driver", "Chromium launch"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

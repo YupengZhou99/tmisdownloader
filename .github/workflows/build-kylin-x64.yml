@@ -1,0 +1,46 @@
+name: Build TMIS Kylin V10 x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'codex/kylin-x64-stock'
+    paths:
+      - 'TMIS数据批量抓取工具V5.0_副本.py'
+      - 'tmis_runtime.py'
+      - 'requirements-linux-x64.txt'
+      - 'scripts/build-linux-x64.sh'
+      - 'scripts/launch-linux.sh'
+      - 'scripts/jiangsu_stock_plan.json'
+      - 'tests/test_report_*.py'
+      - 'tests/fixtures/stock-query.html'
+      - 'LINUX麒麟V10使用说明.md'
+      - 'outputs/kylin-stock-20260916/*.xlsx'
+      - '.github/workflows/build-kylin-x64.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify in glibc 2.31 container
+        run: >-
+          docker run --rm --platform linux/amd64 --shm-size=1g
+          -e BUILD_COMMIT="${{ github.sha }}"
+          -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          python:3.11-bullseye bash scripts/build-linux-x64.sh
+      - name: Upload Linux application and parameters
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMIS-Kylin-V10-x64
+          path: |
+            dist/TMIS-Kylin-V10-x64.tar.gz
+            dist/TMIS-Kylin-V10-x64.tar.gz.sha256
+            outputs/kylin-stock-20260916/江苏库存自由查询_202501-202608_14库280任务.xlsx
+            LINUX麒麟V10使用说明.md
+          if-no-files-found: error
+          retention-days: 30
