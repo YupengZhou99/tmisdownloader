@@ -10,6 +10,7 @@ on:
       - 'tmis_runtime.py'
       - 'requirements-linux-x64.txt'
       - 'scripts/build-linux-x64.sh'
+      - 'scripts/debian-bullseye-snapshot.list'
       - 'scripts/launch-linux.sh'
       - 'scripts/jiangsu_stock_plan.json'
       - 'tests/test_report_*.py'
@@ -32,7 +33,8 @@ jobs:
           docker run --rm --platform linux/amd64 --shm-size=1g
           -e BUILD_COMMIT="${{ github.sha }}"
           -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
-          python:3.11-bullseye bash scripts/build-linux-x64.sh
+          python:3.11-bullseye@sha256:df0bd610af061603b29d63eb82027b64d5a3f15506e39270422b10b2a55079fc
+          bash scripts/build-linux-x64.sh
       - name: Upload Linux application and parameters
         uses: actions/upload-artifact@v4
         with:

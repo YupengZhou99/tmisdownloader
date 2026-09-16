@@ -1,0 +1,3 @@
+# Official signed Debian snapshot; preserve the Kylin-compatible glibc 2.31 ABI.
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260801T000000Z/ bullseye main
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260801T000000Z/ bullseye-security main

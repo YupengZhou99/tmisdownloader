@@ -5,7 +5,8 @@ export DEBIAN_FRONTEND=noninteractive
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PYTHONUTF8=1
 
-apt-get update
+cp scripts/debian-bullseye-snapshot.list /etc/apt/sources.list
+apt-get -o Acquire::Retries=3 update
 apt-get install -y --no-install-recommends \
   tk tcl libtk8.6 libtcl8.6 xvfb xauth fonts-noto-cjk \
   libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
@@ -37,6 +38,7 @@ cp 'outputs/kylin-stock-20260916/江苏库存自由查询_202501-202608_14库280
 cp 'LINUX麒麟V10使用说明.md' "$task_bundle/"
 python -m pip freeze > "$task_bundle/build-dependencies.txt"
 printf 'Git commit: %s\nBuild OS: Debian 11 (bullseye)\n' "${BUILD_COMMIT:-unknown}" > "$task_bundle/build-info.txt"
+printf 'Debian package snapshot: 20260801T000000Z\n' >> "$task_bundle/build-info.txt"
 getconf GNU_LIBC_VERSION >> "$task_bundle/build-info.txt"
 python --version >> "$task_bundle/build-info.txt"
 file "$task_bundle/TMIS-Data-Free-Query" | tee "$task_bundle/architecture.txt"

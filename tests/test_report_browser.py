@@ -145,6 +145,17 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 worker.return_value.start.assert_called_once()
             self.assertEqual(self.app.target_url, self.url)
             self.assertTrue(self.app.is_running)
+            # 使用手动粘贴的同一 URL，走真实登录 -> 读任务 -> 查询 -> 下载路径。
+            sample = pd.read_excel(ROOT / PLAN["output_file"], sheet_name="库存参数", dtype=str).iloc[[0]]
+            with patch.object(APP.pd, "read_excel", return_value={"库存参数": sample}):
+                await self.app._run_with_stop(str(ROOT / PLAN["output_file"]), directory)
+            files = list(Path(directory).glob("*.xlsx"))
+            self.assertEqual(len(files), 1, "manual URL should lead to an actual report download")
+            results_path = next(Path(directory).glob("下载结果_*.csv"))
+            with results_path.open(encoding="utf-8-sig", newline="") as stream:
+                results = list(csv.DictReader(stream))
+            self.assertEqual([row["状态"] for row in results], ["成功"])
+            self.assertNotIn("local-test-token", results_path.read_text(encoding="utf-8-sig"))
 
     async def test_stop_closes_inflight_browser(self):
         closed = asyncio.Event()
