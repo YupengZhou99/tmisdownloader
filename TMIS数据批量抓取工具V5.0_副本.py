@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TMIS数据自由查询批量抓取工具 v5.2
+TMIS数据自由查询批量抓取工具 v5.3
 ===========================
 使用 Playwright 自动启动系统 Chrome 浏览器，携 Token 登录内网系统，
 自动填表、查询、导出报表，并可选数据后处理。
 
 功能：
-1. URL 狙击手：捕获 Token 链接 + 自动启动浏览器执行任务
+1. 独立登录和常驻浏览器；队列结束后保持待命
 2. 自动检测系统 Chrome（channel="chrome"），支持手动指定路径
 3. 智能/自定义命名（参数表"文件名称"列 或 自动命名）
 4. 收入/支出/退库/库存业务分流（侧边栏动态导航、字段复用映射）
 5. 可选数据后处理（openpyxl 保留原始格式）
-6. UI 日期选择器（默认当日，Excel参数优先）
+6. 后备日期输入（默认留空，Excel参数优先）
 7. 查询成功精确检测（等待"原样导出"按钮可用）
 8. 智能标签页管理（类型切换时自动关闭旧标签页，防止 DOM 冲突）
+9. 多参数表、运行中追加、失败重试、暂停和本机任务恢复
 
 依赖：pip install playwright pandas openpyxl psutil
       pip install pyperclip  (可选)
@@ -25,24 +26,23 @@ import sys
 import os
 import re
 import threading
-import csv
 import tempfile
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox, simpledialog
+from tkinter import messagebox
 import pandas as pd
 from openpyxl import load_workbook
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import time
-import traceback
 import asyncio
 
 # Playwright
 from playwright.async_api import async_playwright, Page
+from tmis_ui import QueueWindow
 from tmis_runtime import (
     browser_environment, browser_launch_options, bundled_browser_path,
     normalize_query_date, normalize_task_row, option_matches,
-    redact_urls, validate_login_url,
+    redact_urls, publish_download,
 )
 
 # URL 狙击手所需
@@ -233,742 +233,8 @@ REPORT_CONFIGS = {
 # ============================================================================
 # 主应用类
 # ============================================================================
-class TMISAutoApp(tk.Tk):
-    """TMIS数据批量抓取工具主窗口"""
-
-    # ====================================================================
-    # 设计系统：颜色常量
-    # ====================================================================
-    # 深色主题配色
-    BG_PRIMARY   = "#1a1a2e"    # 主背景（深靛蓝）
-    BG_CARD      = "#16213e"    # 卡片背景
-    BG_INPUT     = "#0f3460"    # 输入框背景
-    BG_LOG       = "#0d1117"    # 日志区背景（近纯黑）
-    FG_PRIMARY   = "#e8e8e8"    # 主文字
-    FG_SECONDARY = "#8892a8"    # 次要文字
-    FG_ACCENT    = "#00d2ff"    # 强调色（青蓝）
-    CLR_GREEN    = "#00e676"    # 成功绿
-    CLR_RED      = "#ff5252"    # 错误红
-    CLR_YELLOW   = "#ffd740"    # 警告黄
-    CLR_BLUE     = "#448aff"    # 按钮蓝
-    CLR_HOVER_G  = "#00c853"    # 绿按钮悬浮
-    CLR_HOVER_R  = "#ff1744"    # 红按钮悬浮
-    CLR_HOVER_B  = "#2979ff"    # 蓝按钮悬浮
-
-    def __init__(self):
-        super().__init__()
-        self.title("TMIS  数据自由查询批量抓取工具 v5.2")
-        self.geometry("980x820")
-        self.resizable(True, True)
-        self.configure(bg=self.BG_PRIMARY)
-        self.minsize(800, 650)
-
-        # 初始化变量
-        self.excel_path = tk.StringVar()
-        packaged_parameters = os.path.join(
-            os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__)),
-            "江苏库存自由查询_202501-202608_14库280任务.xlsx",
-        )
-        if os.path.isfile(packaged_parameters):
-            self.excel_path.set(packaged_parameters)
-        self.download_folder = tk.StringVar()
-        self.worker_thread = None
-        self.sniper_thread = None
-        self.is_running = False
-        self._active_browser = None
-
-        # URL 狙击手捕获到的登录链接
-        self.target_url = None
-
-        # 日期变量（默认当天）
-        today = datetime.now()
-        self.start_date_var = tk.StringVar(value=today.strftime("%Y%m%d"))
-        self.end_date_var = tk.StringVar(value=today.strftime("%Y%m%d"))
-
-        # 数据后处理开关
-        self.enable_postprocess = tk.BooleanVar(value=False)
-
-        # 命名模式
-        self.naming_mode = tk.StringVar(value="param")
-
-        # Chrome 路径（空=自动检测）
-        self.chrome_path_var = tk.StringVar()
-
-        # 记录当前导航到的数据类型
-        self.current_nav_type = None
-
-        # 构建 GUI
-        self._init_styles()
-        self._build_gui()
-
-    # ========================================================================
-    # 样式初始化
-    # ========================================================================
-    def _init_styles(self):
-        """配置 ttk 自定义主题样式"""
-        style = ttk.Style(self)
-        style.theme_use("clam")
-
-        # ---- 全局 Frame ----
-        style.configure("Card.TFrame", background=self.BG_CARD)
-        style.configure("Main.TFrame", background=self.BG_PRIMARY)
-
-        # ---- Label ----
-        style.configure("Title.TLabel",
-                        background=self.BG_PRIMARY, foreground=self.FG_ACCENT,
-                        font=("Segoe UI", 18, "bold"))
-        style.configure("Subtitle.TLabel",
-                        background=self.BG_PRIMARY, foreground=self.FG_SECONDARY,
-                        font=("Segoe UI", 9))
-        style.configure("Card.TLabel",
-                        background=self.BG_CARD, foreground=self.FG_SECONDARY,
-                        font=("Segoe UI", 10))
-        style.configure("LogTitle.TLabel",
-                        background=self.BG_PRIMARY, foreground=self.FG_SECONDARY,
-                        font=("Segoe UI", 9, "bold"))
-
-        # ---- Entry (路径显示) ----
-        style.configure("Path.TEntry",
-                        fieldbackground=self.BG_INPUT, foreground=self.FG_PRIMARY,
-                        borderwidth=0, padding=(8, 6))
-        style.map("Path.TEntry",
-                  fieldbackground=[("readonly", self.BG_INPUT)],
-                  foreground=[("readonly", self.FG_PRIMARY)])
-
-        # ---- Separator ----
-        style.configure("Gray.TSeparator", background="#2a2a4a")
-
-    def _make_btn(self, parent, text, command, color, hover_color, width=18, state=tk.NORMAL):
-        """创建自定义扁平化按钮（tk.Button，支持悬浮变色）"""
-        btn = tk.Button(
-            parent, text=text, command=command,
-            bg=color, fg="white", activebackground=hover_color, activeforeground="white",
-            font=("Segoe UI", 10, "bold"), relief="flat", cursor="hand2",
-            bd=0, padx=16, pady=8, width=width, state=state,
-            highlightthickness=0
-        )
-        # 悬浮效果
-        btn.bind("<Enter>", lambda e: btn.config(bg=hover_color) if btn["state"] != "disabled" else None)
-        btn.bind("<Leave>", lambda e: btn.config(bg=color) if btn["state"] != "disabled" else None)
-        # 存储原始颜色以便恢复
-        btn._base_color = color
-        btn._hover_color = hover_color
-        return btn
-
-    # ========================================================================
-    # GUI 构建
-    # ========================================================================
-    def _build_gui(self):
-        """构建现代化深色主题界面"""
-
-        # 外层容器
-        container = ttk.Frame(self, style="Main.TFrame", padding=(24, 16))
-        container.pack(fill=tk.BOTH, expand=True)
-
-        # ============ 标题区 ============
-        header = ttk.Frame(container, style="Main.TFrame")
-        header.pack(fill=tk.X, pady=(0, 12))
-
-        ttk.Label(header, text="TMIS  数据自由查询批量抓取工具",
-                  style="Title.TLabel").pack(side=tk.LEFT)
-        ttk.Label(header, text="v5.2   |   收入 / 支出 / 退库 / 库存 自动填表 / 查询 / 导出 / 清洗",
-                  style="Subtitle.TLabel").pack(side=tk.LEFT, padx=(16, 0), pady=(8, 0))
-
-        # ============ 文件选择卡片 ============
-        card = ttk.Frame(container, style="Card.TFrame", padding=(20, 16))
-        card.pack(fill=tk.X, pady=(0, 10))
-
-        # --- Excel 文件行 ---
-        row1 = ttk.Frame(card, style="Card.TFrame")
-        row1.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(row1, text="参数文件", style="Card.TLabel", width=10).pack(side=tk.LEFT)
-        excel_entry = ttk.Entry(row1, textvariable=self.excel_path,
-                                style="Path.TEntry", state="readonly")
-        excel_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 10))
-        self._make_btn(row1, "选择", self._select_excel,
-                       self.BG_INPUT, "#1a5276", width=8).pack(side=tk.LEFT)
-
-        # --- 保存文件夹行 ---
-        row2 = ttk.Frame(card, style="Card.TFrame")
-        row2.pack(fill=tk.X)
-
-        ttk.Label(row2, text="保存目录", style="Card.TLabel", width=10).pack(side=tk.LEFT)
-        folder_entry = ttk.Entry(row2, textvariable=self.download_folder,
-                                 style="Path.TEntry", state="readonly")
-        folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 10))
-        self._make_btn(row2, "选择", self._select_folder,
-                       self.BG_INPUT, "#1a5276", width=8).pack(side=tk.LEFT)
-
-        # --- 日期行 ---
-        row3 = ttk.Frame(card, style="Card.TFrame")
-        row3.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Label(row3, text="起始日期", style="Card.TLabel", width=10).pack(side=tk.LEFT)
-        tk.Entry(row3, textvariable=self.start_date_var,
-                 bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
-                 font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0, width=14
-                 ).pack(side=tk.LEFT, padx=(8, 20))
-
-        ttk.Label(row3, text="终止日期", style="Card.TLabel", width=10).pack(side=tk.LEFT)
-        tk.Entry(row3, textvariable=self.end_date_var,
-                 bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
-                 font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0, width=14
-                 ).pack(side=tk.LEFT, padx=(8, 10))
-
-        ttk.Label(row3, text="(YYYY/YYYYMM/YYYYMMDD，Excel优先)",
-                  style="Card.TLabel").pack(side=tk.LEFT, padx=(10, 0))
-
-        # --- Chrome 路径行 ---
-        row4 = ttk.Frame(card, style="Card.TFrame")
-        row4.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Label(row4, text="浏览器路径", style="Card.TLabel", width=10).pack(side=tk.LEFT)
-        tk.Entry(row4, textvariable=self.chrome_path_var,
-                 bg=self.BG_INPUT, fg=self.FG_PRIMARY, insertbackground=self.FG_ACCENT,
-                 font=("Segoe UI", 10), relief="flat", bd=0, highlightthickness=0
-                 ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 10))
-        ttk.Label(row4, text="(空=自动检测)", style="Card.TLabel").pack(side=tk.LEFT)
-
-        # ============ 选项卡片 ============
-        opt_card = ttk.Frame(container, style="Card.TFrame", padding=(20, 10))
-        opt_card.pack(fill=tk.X, pady=(0, 10))
-
-        tk.Checkbutton(
-            opt_card, text="启用数据后处理（按PPT清理库存列/零值特殊科目）",
-            variable=self.enable_postprocess,
-            bg=self.BG_CARD, fg=self.FG_SECONDARY, activebackground=self.BG_CARD,
-            activeforeground=self.FG_PRIMARY, selectcolor=self.BG_INPUT,
-            font=("Segoe UI", 10), highlightthickness=0, bd=0
-        ).pack(side=tk.LEFT, padx=(0, 30))
-
-        ttk.Label(opt_card, text="命名:", style="Card.TLabel").pack(side=tk.LEFT, padx=(0, 6))
-        for txt, val in [(" 参数表命名", "param"), ("自动命名", "auto")]:
-            tk.Radiobutton(
-                opt_card, text=txt, variable=self.naming_mode, value=val,
-                bg=self.BG_CARD, fg=self.FG_SECONDARY, activebackground=self.BG_CARD,
-                activeforeground=self.FG_PRIMARY, selectcolor=self.BG_INPUT,
-                font=("Segoe UI", 10), highlightthickness=0, bd=0
-            ).pack(side=tk.LEFT, padx=(0, 10))
-
-        # ============ 操作按钮栏 ============
-        btn_bar = ttk.Frame(container, style="Main.TFrame")
-        btn_bar.pack(fill=tk.X, pady=(4, 10))
-
-        self.start_btn = self._make_btn(
-            btn_bar, "  开始批量执行  ", self._start_task,
-            self.CLR_GREEN, self.CLR_HOVER_G, width=16
-        )
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.stop_btn = self._make_btn(
-            btn_bar, "  停止  ", self._stop_task,
-            self.CLR_RED, self.CLR_HOVER_R, width=8, state=tk.DISABLED
-        )
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.login_btn = self._make_btn(
-            btn_bar, "粘贴登录链接", self._paste_login_url,
-            self.BG_INPUT, "#1a5276", width=12
-        )
-        self.login_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.sniper_btn = self._make_btn(
-            btn_bar, "  捕获登录链接  ", self._start_sniper,
-            self.CLR_BLUE, self.CLR_HOVER_B, width=16
-        )
-        if not sys.platform.startswith("linux"):
-            self.sniper_btn.pack(side=tk.RIGHT)
-
-        # ============ 日志区域 ============
-        log_header = ttk.Frame(container, style="Main.TFrame")
-        log_header.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(log_header, text="CONSOLE", style="LogTitle.TLabel").pack(side=tk.LEFT)
-
-        # 日志文本框
-        log_frame = tk.Frame(container, bg=self.BG_LOG, bd=0, highlightthickness=1,
-                             highlightbackground="#2a2a4a")
-        log_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.log_text = tk.Text(
-            log_frame, bg=self.BG_LOG, fg="#8cc8a8",
-            font=("Cascadia Code", 10), wrap=tk.WORD,
-            insertbackground=self.FG_ACCENT, selectbackground="#264f78",
-            relief="flat", bd=0, padx=12, pady=10,
-            highlightthickness=0
-        )
-
-        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # 日志颜色标签
-        self.log_text.tag_config("INFO",    foreground="#8cc8a8")   # 柔绿
-        self.log_text.tag_config("SUCCESS", foreground=self.CLR_GREEN)
-        self.log_text.tag_config("ERROR",   foreground=self.CLR_RED)
-        self.log_text.tag_config("WARN",    foreground=self.CLR_YELLOW)
-        self.log_text.tag_config("TS",      foreground="#5a6a7a")   # 时间戳灰
-
-        # 禁止用户编辑日志区（但允许选中复制）
-        self.log_text.config(state=tk.DISABLED)
-
-    # ========================================================================
-    # 用户交互方法
-    # ========================================================================
-    def _select_excel(self):
-        path = filedialog.askopenfilename(
-            title="选择Excel参数文件",
-            filetypes=[("Excel文件", "*.xlsx *.xls"), ("所有文件", "*.*")]
-        )
-        if path:
-            self.excel_path.set(path)
-            self.log(f"已选择参数文件: {path}")
-
-    def _select_folder(self):
-        path = filedialog.askdirectory(title="选择下载保存文件夹")
-        if path:
-            self.download_folder.set(path)
-            self.log(f"已选择保存文件夹: {path}")
-
-    def log(self, msg: str, level: str = "INFO"):
-        """线程安全的日志输出"""
-        msg = redact_urls(msg)
-        def _append():
-            self.log_text.config(state=tk.NORMAL)
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.log_text.insert(tk.END, f"[{ts}]", "TS")
-            self.log_text.insert(tk.END, f" {msg}\n", level)
-            self.log_text.see(tk.END)
-            self.log_text.config(state=tk.DISABLED)
-        self.after(0, _append)
-
-    def _paste_login_url(self):
-        value = simpledialog.askstring(
-            "登录链接", "粘贴本次有效的完整登录链接（仅存于内存）：",
-            parent=self, show="*",
-        )
-        if value is None:
-            return
-        try:
-            self.target_url = validate_login_url(value)
-        except ValueError as error:
-            messagebox.showerror("登录链接无效", str(error), parent=self)
-            return
-        self.log("登录链接已设置，请点击「开始批量执行」", "SUCCESS")
-
-    # ========================================================================
-    # 需求1：URL 狙击手 —— 捕获 Token 链接 + 全自动启动
-    # ========================================================================
-    def _start_sniper(self):
-        """启动 URL 狙击手守护线程"""
-        global sniper_flag
-
-        if sys.platform.startswith("linux"):
-            self._paste_login_url()
-            return
-
-        if psutil is None:
-            messagebox.showerror("缺少依赖", "请先安装 psutil: pip install psutil")
-            return
-
-        # 预检：Excel 和文件夹必须已选好（捕获后会直接开始任务）
-        if not self.excel_path.get() or not os.path.exists(self.excel_path.get()):
-            messagebox.showwarning("提示", "请先选择 Excel 参数文件，捕获成功后将自动开始任务")
-            return
-        if not self.download_folder.get() or not os.path.isdir(self.download_folder.get()):
-            messagebox.showwarning("提示", "请先选择保存目录，捕获成功后将自动开始任务")
-            return
-
-        sniper_flag = False
-        self.target_url = None
-        self.sniper_btn.config(state=tk.DISABLED, text="  正在监控...  ", bg="#5c6bc0")
-        self.log("URL 狙击手已启动 (10ms 极速轮询)", "WARN")
-        self.log("请在客户端触发系统登录，本工具将自动拦截 Token 链接", "WARN")
-
-        self.sniper_thread = threading.Thread(target=self._sniper_worker, daemon=True)
-        self.sniper_thread.start()
-
-    def _sniper_worker(self):
-        """
-        URL 狙击手核心逻辑：
-        以 10ms 极限间隔高频轮询新浏览器进程，从 cmdline 中提取 http 链接，
-        立即 kill 进程（在请求发出前截断），将链接保存到 self.target_url，
-        然后自动触发批量任务执行。
-        """
-        global sniper_flag
-
-        # 记录启动前已有的浏览器进程 PID，避免误杀
-        browser_names = {"chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe",
-                         "chrome", "msedge", "firefox", "chromium", "chromium-browser"}
-        known_pids = set()
-        for proc in psutil.process_iter(["pid", "name"]):
-            try:
-                if proc.info["name"] and proc.info["name"].lower() in browser_names:
-                    known_pids.add(proc.info["pid"])
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-
-        self.log(f"已标记 {len(known_pids)} 个已有浏览器进程，开始监控...", "INFO")
-
-        captured_url = None
-        max_wait = 180  # 最多等待3分钟
-        start_time = time.time()
-
-        while not sniper_flag and (time.time() - start_time) < max_wait:
-            try:
-                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-                    try:
-                        pname = (proc.info["name"] or "").lower()
-                        if pname not in browser_names:
-                            continue
-                        if proc.info["pid"] in known_pids:
-                            continue
-
-                        # 发现新浏览器进程！扫描命令行参数
-                        cmdline = proc.info["cmdline"] or []
-                        for arg in cmdline:
-                            if isinstance(arg, str) and arg.startswith("http"):
-                                captured_url = arg
-                                # 立即击杀！在请求发出前掐断进程
-                                try:
-                                    proc.kill()
-                                    self.log(f"已击杀浏览器进程 PID={proc.info['pid']}", "SUCCESS")
-                                except Exception as kill_err:
-                                    self.log(f"击杀进程失败: {kill_err}", "ERROR")
-                                break
-
-                        if captured_url:
-                            break
-
-                        known_pids.add(proc.info["pid"])
-
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
-
-                if captured_url:
-                    break
-
-            except Exception as e:
-                self.log(f"狙击手监控异常: {e}", "ERROR")
-
-            time.sleep(0.01)  # 10ms 极限轮询间隔
-
-        # ---- 处理结果 ----
-        if captured_url:
-            self.target_url = captured_url
-            self.log("Token 链接捕获成功!", "SUCCESS")
-
-            # 同时复制到剪贴板（备用）
-            try:
-                if pyperclip:
-                    pyperclip.copy(captured_url)
-                    self.log("链接已同步复制到剪贴板（备用）", "INFO")
-            except Exception:
-                pass
-
-            self.log("即将自动启动 Playwright 浏览器并执行全部任务...", "SUCCESS")
-
-            # 恢复按钮状态，然后自动触发任务执行
-            self.after(0, lambda: self.sniper_btn.config(
-                state=tk.NORMAL, text="  捕获登录链接  ", bg=self.CLR_BLUE
-            ))
-            # 延迟500ms后自动开始任务，让UI有时间更新
-            self.after(500, self._start_task)
-
-        else:
-            self.log("狙击手监控超时（180秒），未捕获到链接", "WARN")
-            self.after(0, lambda: self.sniper_btn.config(
-                state=tk.NORMAL, text="  捕获登录链接  ", bg=self.CLR_BLUE
-            ))
-
-    # ========================================================================
-    # 批量任务启动与停止
-    # ========================================================================
-    def _start_task(self):
-        """启动批量执行"""
-        global stop_flag
-
-        excel_file = self.excel_path.get()
-        dl_folder = self.download_folder.get()
-
-        if not excel_file or not os.path.exists(excel_file):
-            messagebox.showerror("错误", "请选择有效的Excel参数文件")
-            return
-        if not dl_folder or not os.path.isdir(dl_folder):
-            messagebox.showerror("错误", "请选择有效的下载保存文件夹")
-            return
-
-        if self.is_running:
-            return
-
-        # 支持捕获或手动粘贴的 Token 链接。
-        if not self.target_url:
-            messagebox.showwarning("提示",
-                "请先点击「粘贴登录链接」，或通过「捕获登录链接」获取本次登录地址。")
-            return
-
-        stop_flag = False
-        self.current_nav_type = None  # 重置导航状态
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.login_btn.config(state=tk.DISABLED)
-        self.sniper_btn.config(state=tk.DISABLED)
-        self.is_running = True
-
-        # Tk 变量只在主线程读取，后台使用本次执行快照。
-        self.run_options = {
-            "browser_path": self.chrome_path_var.get().strip(),
-            "start_date": self.start_date_var.get().strip(),
-            "end_date": self.end_date_var.get().strip(),
-            "postprocess": self.enable_postprocess.get(),
-            "naming_mode": self.naming_mode.get(),
-        }
-
-        self.log("=" * 50, "SUCCESS")
-        self.log("批量任务开始执行", "SUCCESS")
-        self.log("=" * 50, "SUCCESS")
-
-        self.worker_thread = threading.Thread(
-            target=self._worker, args=(excel_file, dl_folder), daemon=True
-        )
-        self.worker_thread.start()
-
-    def _stop_task(self):
-        """停止任务"""
-        global stop_flag, sniper_flag
-        stop_flag = True
-        sniper_flag = True
-        self.log("用户请求停止任务...", "WARN")
-
-    def _worker(self, excel_file: str, dl_folder: str):
-        """后台工作线程"""
-        try:
-            asyncio.run(self._run_with_stop(excel_file, dl_folder))
-        except Exception as e:
-            self.log(f"任务执行出错: {e}", "ERROR")
-            self.log(traceback.format_exc(), "ERROR")
-        finally:
-            self.is_running = False
-            self.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
-            self.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
-            self.after(0, lambda: self.login_btn.config(state=tk.NORMAL))
-            self.after(0, lambda: self.sniper_btn.config(state=tk.NORMAL))
-            self.log("=" * 50, "SUCCESS")
-            self.log("本次执行已结束，请查看执行汇总及下载结果清单", "INFO")
-            self.log("=" * 50, "SUCCESS")
-
-    async def _run_with_stop(self, excel_file, dl_folder):
-        """停止时关闭本次浏览器，让在途查询和下载及时返回。"""
-        work = asyncio.create_task(self._run_automation(excel_file, dl_folder))
-        try:
-            while not work.done():
-                if stop_flag and self._active_browser is not None:
-                    await self._active_browser.close()
-                    break
-                await asyncio.sleep(0.2)
-            await work
-        finally:
-            if self._active_browser is not None:
-                await self._active_browser.close()
-                self._active_browser = None
-
-    # ========================================================================
-    # 核心自动化逻辑（异步）
-    # ========================================================================
-    async def _run_automation(self, excel_file: str, dl_folder: str):
-        """主自动化流程（全新浏览器实例 + Token URL 直达）"""
-        global stop_flag
-
-        # ---- 1. 读取 Excel ----
-        self.log("正在读取Excel参数文件...")
-        try:
-            # 读取所有 sheet
-            sheet_dict = pd.read_excel(excel_file, sheet_name=None, dtype=str)
-            tasks = []
-            
-            for sheet_name, df_sheet in sheet_dict.items():
-                current_sheet_sz_type = None
-                for report_type in REPORT_CONFIGS:
-                    if report_type in sheet_name:
-                        current_sheet_sz_type = report_type
-                        break
-                else:
-                    # 尝试从历史“收支类型/数据类型”列获取，兼容老模板
-                    if "收支类型" not in df_sheet.columns and "数据类型" not in df_sheet.columns:
-                        continue
-                
-                df_sheet = df_sheet.fillna("")
-                
-                # 表头映射替换 (将中文列名映射为内部 pXXX 变量名)
-                new_columns = {}
-                for col in df_sheet.columns:
-                    col_str = str(col).strip()
-                    if col_str in COLUMN_MAPPING:
-                        new_columns[col_str] = COLUMN_MAPPING[col_str]
-                
-                if new_columns:
-                    df_sheet.rename(columns=new_columns, inplace=True)
-                
-                for _, row in df_sheet.iterrows():
-                    if not any(str(value).strip() for value in row):
-                        continue
-                    # 如果行内本身有“收支类型/数据类型”则优先（兼容老模板）
-                    row_sz = str(row.get("收支类型", row.get("数据类型", ""))).strip()
-                    if row_sz in REPORT_CONFIGS:
-                        current_sz_type = row_sz
-                    else:
-                        current_sz_type = current_sheet_sz_type if current_sheet_sz_type else "收入"
-
-                    if current_sz_type not in REPORT_CONFIGS:
-                        self.log(f"跳过暂不支持的任务类型: {current_sz_type}", "WARN")
-                        continue
-                        
-                    for field, fallback in (("pStartDate", "start_date"), ("pEndDate", "end_date")):
-                        if not str(row.get(field, "")).strip():
-                            row[field] = self.run_options[fallback]
-                    tasks.append((current_sz_type, normalize_task_row(row)))
-                    
-            if not tasks:
-                self.log("未在Excel中找到有效的任务数据 (请检查Sheet名称是否包含'收入'/'支出'/'退库'/'库存')", "ERROR")
-                return
-                
-            total = len(tasks)
-            self.log(f"成功读取 {total} 条任务", "SUCCESS")
-        except Exception as e:
-            self.log(f"读取Excel失败: {e}", "ERROR")
-            return
-
-        # ---- 2. 启动全新浏览器并携 Token 登录 ----
-        self.log("正在启动 Chrome/Chromium 浏览器 (有头模式)...")
-        async with async_playwright() as pw:
-            try:
-                launch_kwargs = {
-                    "headless": False,
-                    "env": browser_environment(),
-                    "args": [
-                        "--ignore-certificate-errors",
-                        "--ignore-ssl-errors",
-                        "--no-first-run",
-                        "--disable-popup-blocking",
-                        "--start-maximized",
-                    ]
-                }
-                launch_kwargs.update(browser_launch_options(
-                    self.run_options["browser_path"], bundled_browser_path(),
-                ))
-                self.log("浏览器: " + launch_kwargs.get("executable_path", "系统 Chrome"))
-                browser = await pw.chromium.launch(**launch_kwargs)
-                self._active_browser = browser
-            except Exception as e:
-                self.log(f"启动浏览器失败: {e}", "ERROR")
-                self.log("请填写可用浏览器路径，或完整解压附带 browser 目录的 Linux 包。", "WARN")
-                return
-
-            self.log("浏览器启动成功", "SUCCESS")
-
-            # 创建上下文和页面
-            context = await browser.new_context(
-                ignore_https_errors=True,   # 上下文级别也忽略 HTTPS 错误
-                viewport=None,              # 使用浏览器窗口实际大小
-                accept_downloads=True,      # 允许文件下载
-            )
-            page = await context.new_page()
-
-            # 携 Token 直达内网主页
-            self.log(f"正在携 Token 访问内网系统...")
-            try:
-                await page.goto(self.target_url, wait_until="domcontentloaded", timeout=60000)
-            except Exception as e:
-                if stop_flag:
-                    return
-                self.log(f"页面加载提示: {e}", "WARN")
-            try:
-                await page.get_by_text("固定报表", exact=True).first.wait_for(state="visible", timeout=30000)
-            except Exception:
-                if not stop_flag:
-                    self.log("未进入 TMIS 工作界面。请检查内网连接和登录链接是否已过期，重新粘贴有效 URL 后再试。", "ERROR")
-                return
-            self.log("已进入 TMIS 工作界面，开始执行报表任务", "SUCCESS")
-
-            # ---- 3. 循环处理每一行任务 ----
-            success_count = 0
-            fail_count = 0
-            name_counter = {}
-            result_path = os.path.join(dl_folder, "下载结果_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".csv")
-            result_fields = ["序号", "类型", "文件名称", "国库选择", "起始日期", "终止日期", "展示范围", "状态", "错误"]
-            with open(result_path, "w", encoding="utf-8-sig", newline="") as stream:
-                csv.DictWriter(stream, fieldnames=result_fields).writeheader()
-            self.log("本次逐条执行结果将保存到: " + result_path)
-
-            for idx, (sz_type, row) in enumerate(tasks):
-                if stop_flag:
-                    self.log("用户已停止任务", "WARN")
-                    break
-
-                dynamic_name = self._build_filename(row, sz_type, name_counter)
-                result = dict(zip(result_fields, [
-                    idx + 1, sz_type, dynamic_name, row.get("pTreCode", ""),
-                    row.get("pStartDate", ""), row.get("pEndDate", ""),
-                    row.get("pShowScope", ""), "失败", "",
-                ]))
-
-                self.log(f"\n{'─' * 45}")
-                self.log(f"▶ 第 {idx + 1}/{total} 条任务 [{sz_type}]: {dynamic_name}")
-                self.log(f"{'─' * 45}")
-
-                try:
-                    await self._navigate_sidebar_smart(page, sz_type)
-
-                    await asyncio.sleep(2)
-
-                    await self._fill_form(page, row, sz_type)
-
-                    await self._click_query_and_wait(page, sz_type)
-
-                    keep_original_name = self._should_keep_original_name(row)
-                    saved_path = await self._export_and_save(
-                        page, dl_folder, dynamic_name, sz_type, keep_original_name
-                    )
-
-                    if self.run_options["postprocess"] and saved_path and os.path.exists(saved_path):
-                        self._process_excel_data(saved_path, row, sz_type)
-                    elif not self.run_options["postprocess"]:
-                        self.log("  数据后处理已关闭，跳过", "INFO")
-
-                    success_count += 1
-                    result["状态"] = "成功"
-                    self.log(f"任务完成: {dynamic_name}", "SUCCESS")
-
-                except Exception as e:
-                    result["错误"] = redact_urls(e)
-                    if stop_flag:
-                        result["状态"] = "已停止"
-                        break
-                    fail_count += 1
-                    self.log(f"任务失败: {e}", "ERROR")
-                    self.log(traceback.format_exc(), "ERROR")
-                    # 错误后关闭该标签，下一条重新打开，清除半填表单和旧报表。
-                    await self._close_current_tab(page, sz_type)
-                    self.current_nav_type = None
-                finally:
-                    with open(result_path, "a", encoding="utf-8", newline="") as stream:
-                        csv.DictWriter(stream, fieldnames=result_fields).writerow(result)
-
-                await asyncio.sleep(2)
-
-            # ---- 4. 汇总 ----
-            self.log(f"\n执行汇总: 共 {total} 条, 成功 {success_count} 条, 失败 {fail_count} 条, 未完成 {total - success_count - fail_count} 条",
-                     "SUCCESS" if fail_count == 0 else "WARN")
-
-            # ---- 5. 清理浏览器 ----
-            self.log("正在关闭浏览器...")
-            try:
-                await context.close()
-                await browser.close()
-            except Exception:
-                pass
+class ReportEngine:
+    """Pure report operations; instantiated independently of the desktop UI."""
 
     # ========================================================================
     # 智能/自定义命名
@@ -1202,7 +468,7 @@ class TMISAutoApp(tk.Tk):
 
         await inp.click()
         await asyncio.sleep(0.3)
-        await inp.press("Control+a")
+        await inp.press("Meta+a" if sys.platform == "darwin" else "Control+a")
         await asyncio.sleep(0.1)
         await inp.press("Delete")
         await asyncio.sleep(0.1)
@@ -1225,7 +491,7 @@ class TMISAutoApp(tk.Tk):
 
         await inp.click()
         await asyncio.sleep(0.2)
-        await inp.press("Control+a")
+        await inp.press("Meta+a" if sys.platform == "darwin" else "Control+a")
         await asyncio.sleep(0.1)
         await inp.press("Delete")
         await asyncio.sleep(0.1)
@@ -1360,7 +626,7 @@ class TMISAutoApp(tk.Tk):
             await export_btn.click(force=True)
 
         download = await download_info.value
-        original_name = download.suggested_filename or "report.xlsx"
+        original_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', download.suggested_filename or "report.xlsx")
 
         # 默认保持历史行为：{动态名}_{原文件名}；核对专用模板可关闭，精确输出指定文件名。
         ext = os.path.splitext(original_name)[1] or ".xlsx"
@@ -1376,7 +642,12 @@ class TMISAutoApp(tk.Tk):
             await download.save_as(temp_path)
             if await download.failure() or os.path.getsize(temp_path) == 0:
                 raise IOError("下载失败或文件为空")
-            os.replace(temp_path, save_path)
+            # Both paths are on the same filesystem. Atomic create-if-absent:
+            # never overwrite an earlier report, even when a retry races a file.
+            try:
+                publish_download(temp_path, save_path)
+            except FileExistsError as error:
+                raise FileExistsError("输出文件已存在，未覆盖；请先核对或移走已有文件再重试：" + new_filename) from error
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
@@ -1395,7 +666,7 @@ class TMISAutoApp(tk.Tk):
             ws = wb.active
         except Exception as e:
             self.log(f"  读取导出文件失败: {e}", "ERROR")
-            return
+            raise RuntimeError('后处理无法读取下载文件；原文件保留') from e
 
         if ws.max_row is None or ws.max_row < 2:
             self.log("  导出文件为空，跳过后处理", "WARN")
@@ -1423,10 +694,20 @@ class TMISAutoApp(tk.Tk):
 
         try:
             if changed:
-                wb.save(file_path)
+                # Save beside the owned download, then atomically replace it.
+                # A failed save must leave the original report intact.
+                fd, processed = tempfile.mkstemp(prefix='.tmis-postprocess-', suffix='.xlsx', dir=os.path.dirname(file_path))
+                os.close(fd)
+                try:
+                    wb.save(processed)
+                    os.replace(processed, file_path)
+                finally:
+                    if os.path.exists(processed):
+                        os.unlink(processed)
             self.log("  数据后处理完成", "SUCCESS")
         except Exception as e:
             self.log(f"  保存后处理文件失败: {e}", "ERROR")
+            raise RuntimeError('后处理保存失败；原文件保留，可重试后处理步骤') from e
         finally:
             wb.close()
 
@@ -1548,6 +829,130 @@ class TMISAutoApp(tk.Tk):
 
 
 # ============================================================================
+class TMISAutoApp(QueueWindow, ReportEngine, tk.Tk):
+    """Desktop UI with a persistent service; source configurations stay compatible."""
+    report_configs = REPORT_CONFIGS
+    column_mapping = COLUMN_MAPPING
+    engine_class = ReportEngine
+
+    def _start_sniper(self):
+        """启动 URL 狙击手守护线程"""
+        global sniper_flag
+
+        if sys.platform.startswith("linux"):
+            self._paste_login_url()
+            return
+
+        if psutil is None:
+            messagebox.showerror("缺少依赖", "请先安装 psutil: pip install psutil")
+            return
+
+        if self._state.get('current') or self._state['mode'] in ('running', 'logging_in', 'pausing'):
+            messagebox.showwarning("提示", "请先暂停并等待当前条完成，再重新登录", parent=self)
+            return
+
+        sniper_flag = False
+        self.sniper_btn.config(state=tk.DISABLED, text="  正在监控...  ", bg="#5c6bc0")
+        self.log("URL 狙击手已启动 (10ms 极速轮询)", "WARN")
+        self.log("请在客户端触发系统登录，本工具将自动拦截 Token 链接", "WARN")
+
+        self.sniper_thread = threading.Thread(target=self._sniper_worker, daemon=True)
+        self.sniper_thread.start()
+
+    def _sniper_worker(self):
+        """
+        URL 狙击手核心逻辑：
+        以 10ms 极限间隔高频轮询新浏览器进程，从 cmdline 中提取 http 链接，
+        立即 kill 进程（在请求发出前截断），将链接交给独立登录入口。
+        此兼容入口只用于非 Linux；不会自动导入或启动批量任务。
+        """
+        global sniper_flag
+
+        # 记录启动前已有的浏览器进程 PID，避免误杀
+        browser_names = {"chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe",
+                         "chrome", "msedge", "firefox", "chromium", "chromium-browser"}
+        known_pids = set()
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if proc.info["name"] and proc.info["name"].lower() in browser_names:
+                    known_pids.add(proc.info["pid"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        self.log(f"已标记 {len(known_pids)} 个已有浏览器进程，开始监控...", "INFO")
+
+        captured_url = None
+        max_wait = 180  # 最多等待3分钟
+        start_time = time.time()
+
+        while not sniper_flag and not self._closing and (time.time() - start_time) < max_wait:
+            try:
+                for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                    try:
+                        pname = (proc.info["name"] or "").lower()
+                        if pname not in browser_names:
+                            continue
+                        if proc.info["pid"] in known_pids:
+                            continue
+
+                        # 发现新浏览器进程！扫描命令行参数
+                        cmdline = proc.info["cmdline"] or []
+                        for arg in cmdline:
+                            if isinstance(arg, str) and arg.startswith("http"):
+                                captured_url = arg
+                                # 立即击杀！在请求发出前掐断进程
+                                try:
+                                    proc.kill()
+                                    self.log(f"已击杀浏览器进程 PID={proc.info['pid']}", "SUCCESS")
+                                except Exception as kill_err:
+                                    self.log(f"击杀进程失败: {kill_err}", "ERROR")
+                                break
+
+                        if captured_url:
+                            break
+
+                        known_pids.add(proc.info["pid"])
+
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+
+                if captured_url:
+                    break
+
+            except Exception as e:
+                self.log(f"狙击手监控异常: {e}", "ERROR")
+
+            time.sleep(0.01)  # 10ms 极限轮询间隔
+
+        # ---- 处理结果 ----
+        if captured_url:
+            self.log("Token 链接捕获成功!", "SUCCESS")
+
+            # 同时复制到剪贴板（备用）
+            try:
+                if pyperclip:
+                    pyperclip.copy(captured_url)
+                    self.log("链接已同步复制到剪贴板（备用）", "INFO")
+            except Exception:
+                pass
+
+            self.log("即将打开浏览器登录；参数表和执行队列可另行选择", "SUCCESS")
+
+            # 主线程恢复按钮状态，随后打开独立登录会话。
+            self.post_ui(lambda: self.sniper_btn.config(
+                state=tk.NORMAL, text="  捕获登录链接  ", bg=self.CLR_BLUE
+            ))
+            self.post_ui(lambda: self._paste_login_url(captured_url))
+
+        else:
+            self.log("狙击手监控超时（180秒），未捕获到链接", "WARN")
+            self.post_ui(lambda: self.sniper_btn.config(
+                state=tk.NORMAL, text="  捕获登录链接  ", bg=self.CLR_BLUE
+            ))
+
+
+
+
 # Excel参数模板生成
 # ============================================================================
 def generate_template(output_path: str = "TMIS数据自由查询参数模板_v5.1.xlsx"):
@@ -1575,17 +980,20 @@ def main():
         run_self_check()
         return
 
-    app = TMISAutoApp()
+    try:
+        app = TMISAutoApp()
+    except Exception as error:
+        print("启动失败：" + redact_urls(error), file=sys.stderr)
+        raise SystemExit(1) from error
 
-    app.log("TMIS 数据自由查询批量抓取工具 v5.2 就绪", "SUCCESS")
+    app.log("TMIS 数据自由查询批量抓取工具 v5.3 就绪", "SUCCESS")
     app.log("")
-    app.log("全自动使用步骤")
-    app.log("  1  选择 Excel 参数模板")
-    app.log("  2  选择下载保存目录")
-    app.log("  3  设置日期、命名模式、是否启用后处理")
-    app.log("  4  点击「粘贴登录链接」，输入本次有效的完整 URL")
-    app.log("  5  点击「开始批量执行」")
-    app.log("  6  程序打开 Chrome/Chromium 登录并执行任务")
+    app.log("使用步骤（登录和选表顺序不限）")
+    app.log("  1  粘贴链接并登录，可先打开浏览器，再准备参数表")
+    app.log("  2  多选参数表，选择保存根目录，点击加入队列")
+    app.log("  3  点击开始 / 继续；运行中仍可加入新参数表")
+    app.log("  4  本轮结束后可在失败列表重试；浏览器保持开启")
+    app.log("  5  暂停等待当前条完成；只有退出程序才关闭浏览器")
     app.log("")
     app.log("参数表日期优先；Linux 可自动使用随包附带的 Chromium。", "INFO")
 
@@ -1593,27 +1001,44 @@ def main():
         app.mainloop()
     except KeyboardInterrupt:
         pass
+    finally:
+        app._closing = True
+        app.service.shutdown()
+        app.service.thread.join(timeout=20)
+        if not app.service.thread.is_alive():
+            app.store.close()
 
 
 def run_self_check():
     """在 CI 虚拟桌面验证打包后的 Tk 和 Playwright，不访问 TMIS。"""
     import json
     import platform
-    app = TMISAutoApp()
-    app.withdraw()
-    app.update()
-    if sys.platform.startswith("linux"):
-        assert not app.sniper_btn.winfo_manager()
-    assert callable(app._paste_login_url)
-    app.destroy()
+    with tempfile.TemporaryDirectory(prefix="tmis-self-check-") as state_dir:
+        app = TMISAutoApp(state_dir=state_dir)
+        try:
+            app.withdraw()
+            app.update()
+            if sys.platform.startswith("linux"):
+                assert not app.sniper_btn.winfo_manager()
+            assert callable(app._paste_login_url)
+            assert app.task_tree.winfo_exists() and app.failure_tree.winfo_exists()
+            assert app.service.thread.is_alive()
+        finally:
+            app.service.shutdown()
+            app.service.thread.join(timeout=20)
+            assert not app.service.thread.is_alive()
+            app.store.close()
+            app.destroy()
 
     async def check_browser():
         async with async_playwright() as pw:
             browser_path = bundled_browser_path()
             if not browser_path.is_file():
-                browser_path = pw.chromium.executable_path
+                from pathlib import Path
+                browser_path = Path(pw.chromium.executable_path)
+            launch_options = {'executable_path': str(browser_path)} if browser_path.is_file() else browser_launch_options()
             browser = await pw.chromium.launch(
-                executable_path=str(browser_path), headless=True, env=browser_environment(),
+                **launch_options, headless=True, env=browser_environment(),
             )
             page = await browser.new_page()
             await page.set_content("<title>TMIS packaging check</title><p>库存自由查询</p>")
@@ -1621,7 +1046,7 @@ def run_self_check():
             await browser.close()
 
     asyncio.run(check_browser())
-    print(json.dumps({"status": "ok", "version": "5.2", "machine": platform.machine(), "libc": platform.libc_ver(), "checks": ["Tk GUI", "manual URL entry", "Playwright driver", "Chromium launch"]}, ensure_ascii=False))
+    print(json.dumps({"status": "ok", "version": "5.3", "machine": platform.machine(), "libc": platform.libc_ver(), "checks": ["Tk queue GUI", "manual URL entry", "SQLite queue", "persistent service", "Playwright driver", "Chromium launch"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

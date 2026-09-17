@@ -22,6 +22,7 @@ python -c 'import tkinter; print("Tk:", tkinter.TkVersion)'
 python -m playwright install chromium
 python -m unittest discover -s tests -p 'test_*.py' -v
 TMIS_BROWSER_TESTS=1 xvfb-run -a python -m unittest discover -s tests -p 'test_report_browser.py' -v
+TMIS_GUI_TESTS=1 xvfb-run -a python -m unittest discover -s tests -p 'test_report_ui.py' -v
 
 python -m PyInstaller --noconfirm --clean --onedir --noupx \
   --name TMIS-Data-Free-Query --collect-all playwright \

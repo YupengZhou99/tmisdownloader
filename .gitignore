@@ -25,3 +25,12 @@ venv/
 
 # Downloaded reports (don't commit user data)
 *.xlsx.bak
+
+# Desktop dependencies, local tests and private queue state
+node_modules/
+desktop/release/
+output/playwright/
+.desktop-test-state/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

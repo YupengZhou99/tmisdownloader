@@ -2,22 +2,7 @@ name: Build TMIS Kylin V10 x64
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - 'codex/kylin-x64-stock'
-    paths:
-      - 'TMIS数据批量抓取工具V5.0_副本.py'
-      - 'tmis_runtime.py'
-      - 'requirements-linux-x64.txt'
-      - 'scripts/build-linux-x64.sh'
-      - 'scripts/debian-bullseye-snapshot.list'
-      - 'scripts/launch-linux.sh'
-      - 'scripts/jiangsu_stock_plan.json'
-      - 'tests/test_report_*.py'
-      - 'tests/fixtures/stock-query.html'
-      - 'LINUX麒麟V10使用说明.md'
-      - 'outputs/kylin-stock-20260916/*.xlsx'
-      - '.github/workflows/build-kylin-x64.yml'
+  # Legacy Tk build stays available manually. V6 has its own desktop workflow.
 
 permissions:
   contents: read

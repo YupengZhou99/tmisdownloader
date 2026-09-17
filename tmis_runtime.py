@@ -1,6 +1,7 @@
 """TMIS 参数校验和跨平台运行辅助，不依赖 GUI。"""
 
 import os
+import errno
 import re
 import shutil
 import sys
@@ -57,7 +58,35 @@ def validate_login_url(value):
 
 def redact_urls(message):
     # Playwright 异常会附带 goto 的完整地址，因此不仅处理主动日志。
-    return re.sub(r"https?://[^\s<>\"']+", "[链接已隐藏]", str(message))
+    text = re.sub(r"https?://[^\s<>\"']+", "[链接已隐藏]", str(message))
+    return re.sub(r"(?i)\b(token|access_token|refresh_token|authorization|cookie|sessionid)\s*[:=]\s*[^\r\n,;]+",
+                  r"\1=[凭据已隐藏]", text)
+
+
+def publish_download(temporary, destination):
+    """Publish without clobbering; also support USB filesystems without links."""
+    try:
+        os.link(temporary, destination)
+        return
+    except FileExistsError:
+        raise
+    except OSError as error:
+        if error.errno not in (errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS):
+            raise
+    # An exclusive open still rejects an existing destination on FAT/exFAT.
+    # After a crash a partial file may remain; future retries never overwrite it.
+    created = False
+    try:
+        with open(destination, 'xb') as target:
+            created = True
+            with open(temporary, 'rb') as source:
+                shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+    except BaseException:
+        if created:
+            os.unlink(destination)
+        raise
 
 
 def browser_launch_options(manual_path="", bundled_path=""):

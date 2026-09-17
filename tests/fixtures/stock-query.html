@@ -16,8 +16,12 @@
   <input name="serial" id="serial" value="0">
   <input name="mode" id="mode" value="normal">
 </form>
-<iframe name="fineReportTsasRpt6040" src="/report?serial=0" style="width:100%;height:120px"></iframe>
+<iframe id="report-frame" name="fineReportTsasRpt6040" src="/report?serial=0" style="width:100%;height:120px"></iframe>
 <script>
+const kind = new URLSearchParams(location.search).get('kind') || '库存';
+const frameName = { '收入': 'fineReportTsasRpt6010', '支出': 'fineReportTsasRpt6020', '库存': 'fineReportTsasRpt6040' }[kind];
+document.querySelector('nav span:last-child').textContent = kind + '数据自由查询';
+document.getElementById('reportForm').target = frameName;
 const selects = [
   ['pRptDbType', '报表库选择', ['1 -- 报表库', '0 -- 预处理库']],
   ['pRptType', '报表类型', ['1 -- 日', '2 -- 旬', '3 -- 月', '4 -- 季', '5 -- 年']],
@@ -27,6 +31,13 @@ const selects = [
   ['pShowScope', '展示范围', ['0 -- 全部', '1 -- 下级']],
   ['pAmtUnit', '金额单位', ['0 -- 元', '2 -- 万元']],
 ];
+if (kind !== '库存') {
+  selects.splice(selects.findIndex(row => row[0] === 'pTreAttrib'), 1);
+  selects.push(['pTrimFlag', '调整期标志', ['0 -- 正常期', '1 -- 调整期']],
+               ['pStatSbtLevel', '科目级次', ['4 -- 目', '3 -- 项']]);
+  if (kind === '收入') selects.push(['pTaxOrgProp', '征收机关性质', ['0000000000 -- 不分征收机关']]);
+  else selects.push(['pBdgOrgCode', '预算单位', ['ALL -- ALL']], ['pBnkClass', '银行大类', ['0 -- 全部']]);
+}
 for (const [id, label, options] of selects) {
   const field = document.createElement('div');
   field.className = 'el-form-item';
@@ -43,16 +54,21 @@ for (const [id, label, options] of selects) {
   }
   document.getElementById('fields').append(field);
 }
-for (const [id, label] of [
+const texts = [
   ['pStartDate', '起始日期'], ['pEndDate', '终止日期'], ['pTreCode', '国库选择'],
-  ['pBdgLevel', '预算级次'], ['pBookSbt', '会计科目'], ['pBookAcctName', '会计账户名称'],
-]) {
+  ['pBdgLevel', '预算级次'],
+];
+texts.push(...(kind === '库存' ? [['pBookSbt', '会计科目'], ['pBookAcctName', '会计账户名称']] : [['pSbtCode', '预算科目']]));
+for (const [id, label] of texts) {
   const field = document.createElement('div');
   field.className = 'el-form-item';
   field.innerHTML = '<label for="' + id + '">' + label + '</label><div class="el-input ' + (id.includes('Date') ? 'el-date-editor' : '') + '"><input class="el-input__inner"></div>';
   document.getElementById('fields').append(field);
 }
-for (const label of ['分序时', '分地区', '分国库属性', '分预算级次', '分会计科目', '分会计账户', '是否展示同比']) {
+const checks = kind === '库存' ? ['分序时', '分地区', '分国库属性', '分预算级次', '分会计科目', '分会计账户', '是否展示同比']
+  : kind === '收入' ? ['分序时', '分地区', '分预算级次', '分预算科目', '分征收机关', '是否展示同比']
+  : ['分序时', '分地区', '分预算单位', '分银行大类', '分预算级次', '分预算科目', '是否展示同比'];
+for (const label of checks) {
   const checkbox = document.createElement('label');
   checkbox.className = 'el-checkbox';
   checkbox.textContent = label;

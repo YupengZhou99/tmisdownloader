@@ -1,0 +1,53 @@
+name: Build TMIS Workbench V6 Kylin x64
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'codex/kylin-x64-stock'
+    paths:
+      - 'desktop/**'
+      - 'tmis_*.py'
+      - 'TMIS数据批量抓取工具V5.0_副本.py'
+      - 'tests/test_report_*.py'
+      - 'tests/fixtures/**'
+      - 'tests/desktop_fixture_server.py'
+      - 'scripts/build-desktop-kylin.sh'
+      - 'scripts/launch-desktop-linux.sh'
+      - 'scripts/debian-bullseye-snapshot.list'
+      - 'requirements-linux-x64.txt'
+      - 'DESKTOP_V6.md'
+      - '.github/workflows/build-desktop-kylin.yml'
+permissions:
+  contents: read
+jobs:
+  desktop:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test the exact offline app on glibc 2.31
+        run: >-
+          docker run --rm --platform linux/amd64 --shm-size=1g
+          -e BUILD_COMMIT="${{ github.sha }}"
+          -v "$GITHUB_WORKSPACE:/workspace" -w /workspace
+          python:3.11-bullseye@sha256:df0bd610af061603b29d63eb82027b64d5a3f15506e39270422b10b2a55079fc
+          bash scripts/build-desktop-kylin.sh
+      - name: Upload V6 Linux desktop bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMIS-Workbench-V6-Kylin-x64
+          path: |
+            dist/TMIS-Workbench-V6-Kylin-x64.tar.gz
+            dist/TMIS-Workbench-V6-Kylin-x64.tar.gz.sha256
+            DESKTOP_V6.md
+            output/playwright/desktop-smoke.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload desktop test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMIS-V6-UI-verification
+          path: output/playwright/
+          if-no-files-found: ignore
+          retention-days: 14

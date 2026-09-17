@@ -1,6 +1,7 @@
 """验证本次江苏逐月逐库任务和 Linux 启动参数，均不访问内网。"""
 
 import calendar
+import errno
 import importlib.util
 import json
 import os
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tmis_runtime import (
     browser_environment, browser_launch_options, normalize_query_date,
-    normalize_task_row, option_matches, redact_urls, validate_login_url,
+    normalize_task_row, option_matches, redact_urls, validate_login_url, publish_download,
 )
 
 SPEC = importlib.util.spec_from_file_location("report_app", ROOT / "TMIS数据批量抓取工具V5.0_副本.py")
@@ -86,6 +87,37 @@ class ParameterTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_no_clobber_download_supports_filesystems_without_hardlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'test.part', Path(directory) / 'output.xlsx'
+            source.write_bytes(b'complete-report')
+            with patch('tmis_runtime.os.link', side_effect=OSError(errno.ENOTSUP, 'no hardlinks')):
+                publish_download(source, target)
+                self.assertEqual(target.read_bytes(), b'complete-report')
+                with self.assertRaises(FileExistsError):
+                    publish_download(source, target)
+            self.assertEqual(target.read_bytes(), b'complete-report')
+
+    def test_failed_publish_cleans_only_the_file_created_by_this_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory) / 'test.part', Path(directory) / 'output.xlsx'
+            source.write_bytes(b'complete-report')
+            with patch('tmis_runtime.os.link', side_effect=OSError(errno.ENOTSUP, 'no hardlinks')), patch('tmis_runtime.shutil.copyfileobj', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    publish_download(source, target)
+            self.assertFalse(target.exists())
+            self.assertEqual(source.read_bytes(), b'complete-report')
+
+    def test_postprocess_error_is_reported_and_original_download_is_intact(self):
+        engine = APP.ReportEngine()
+        engine.log = lambda *args: None
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bad.xlsx'
+            path.write_bytes(b'not-an-xlsx')
+            with self.assertRaisesRegex(RuntimeError, '原文件保留'):
+                engine._process_excel_data(str(path), {}, '库存')
+            self.assertEqual(path.read_bytes(), b'not-an-xlsx')
+
     def test_date_validation_and_old_template_compatibility(self):
         self.assertEqual(normalize_query_date("2025-02-28 00:00:00", "1 -- 日"), "20250228")
         self.assertEqual(normalize_query_date("202601", "3 -- 月"), "202601")

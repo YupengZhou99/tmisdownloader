@@ -16,6 +16,9 @@ import pandas as pd
 from playwright.async_api import async_playwright
 from test_report_core import APP, ROOT, PLAN
 from tmis_runtime import normalize_task_row
+from tmis_queue import QueueStore
+from tmis_service import BrowserSession, QueueController, SessionExpired
+from test_report_queue import OPTIONS, plan_fixture
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
@@ -28,6 +31,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.respond(parse_qs(urlsplit(self.path).query))
+
+    def transform_fixture(self, content):
+        return content
 
     def respond(self, params):
         route = urlsplit(self.path).path
@@ -47,6 +53,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return
         else:
             content = (ROOT / "tests/fixtures/stock-query.html").read_bytes()
+            kind = params.get('kind', ['库存'])[0]
+            frame_name = APP.REPORT_CONFIGS.get(kind, APP.REPORT_CONFIGS['库存'])['iframe_name']
+            content = content.replace(b'fineReportTsasRpt6040', frame_name.encode())
+            content = self.transform_fixture(content)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -71,10 +81,11 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         APP.stop_flag = False
         self.pw = await async_playwright().start()
-        self.browser = await self.pw.chromium.launch(headless=True)
+        self.browser_path = os.environ.get('TMIS_TEST_BROWSER_PATH', self.pw.chromium.executable_path)
+        self.browser = await self.pw.chromium.launch(headless=True, executable_path=self.browser_path)
         self.page = await self.browser.new_page(accept_downloads=True)
         await self.page.goto(self.url)
-        self.app = object.__new__(APP.TMISAutoApp)
+        self.app = APP.ReportEngine()
         self.app.run_options = {"start_date": "", "end_date": "", "naming_mode": "param", "browser_path": self.pw.chromium.executable_path, "postprocess": False}
         self.app.current_nav_type = None
         self.app._active_browser = None
@@ -104,6 +115,44 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(list(Path(directory).glob("*.xlsx"))), 2)
             self.assertFalse(list(Path(directory).glob("*.part")))
 
+    async def test_mode_switch_moves_cookie_local_and_session_storage_only_in_memory(self):
+        session = BrowserSession(APP.ReportEngine, lambda *args: None, headless=True)
+        try:
+            await session.login(self.url, self.browser_path)
+            await session.context.add_cookies([{'name': 'session', 'value': 'RAM_COOKIE', 'url': self.url}])
+            await session.page.evaluate("""() => {
+                localStorage.setItem('session', 'RAM_LOCAL');
+                sessionStorage.setItem('session', 'RAM_SESSION');
+            }""")
+            original = session.browser
+            await session.switch_mode(False)
+            self.assertIsNot(session.browser, original)
+            self.assertFalse(session.headless)
+            self.assertTrue(session.ready)
+            self.assertNotIn('token=', session.page.url)
+            self.assertEqual(await session.page.evaluate("sessionStorage.getItem('session')"), 'RAM_SESSION')
+            self.assertEqual(await session.page.evaluate("localStorage.getItem('session')"), 'RAM_LOCAL')
+            self.assertTrue(any(c['value'] == 'RAM_COOKIE' for c in await session.context.cookies()))
+            await session.set_window('minimize')
+            await session.set_window('restore')
+            await session.switch_mode(True)
+            self.assertTrue(session.headless)
+            self.assertEqual(await session.page.evaluate("sessionStorage.getItem('session')"), 'RAM_SESSION')
+            with self.assertRaises(ValueError):
+                await session.set_window('restore')
+            with tempfile.TemporaryDirectory() as directory:
+                store = QueueStore(Path(directory) / 'state')
+                try:
+                    store.add_batch(plan_fixture(1, 'after-switch'), directory)
+                    task = store.claim_next()
+                    saved = await session.execute(task, lambda *args: None)
+                    self.assertTrue(Path(saved).is_file())
+                    self.assertNotIn('RAM_', '\n'.join(store.connection.iterdump()))
+                finally:
+                    store.close()
+        finally:
+            await session.close()
+
     async def test_old_enabled_export_does_not_satisfy_a_new_query(self):
         frame = self.page.frame(name="fineReportTsasRpt6040")
         await frame.locator(".ui-state-enabled").wait_for()
@@ -122,54 +171,132 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             await self.app._fill_dropdown(self.page, "pShowScope", "8 -- 不存在")
         self.assertEqual(await self.page.locator("#serial").input_value(), "0")
 
-    async def test_pasted_url_startup_without_sniper(self):
-        self.app.is_running = False
-        class Button:
-            def config(self, **kwargs): pass
-        class Value:
-            def __init__(self, value): self.value = value
-            def get(self): return self.value
-        self.app.start_btn = self.app.stop_btn = self.app.login_btn = self.app.sniper_btn = Button()
+    async def test_existing_download_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.app.excel_path = Value(str(ROOT / PLAN["output_file"]))
-            self.app.download_folder = Value(directory)
-            self.app.chrome_path_var = Value(self.pw.chromium.executable_path)
-            self.app.start_date_var = self.app.end_date_var = Value("")
-            self.app.naming_mode = Value("param")
-            self.app.enable_postprocess = Value(False)
-            self.app.target_url = None
-            with patch.object(APP.simpledialog, "askstring", return_value=self.url):
-                self.app._paste_login_url()
-            with patch.object(APP.threading, "Thread") as worker:
-                self.app._start_task()
-                worker.return_value.start.assert_called_once()
-            self.assertEqual(self.app.target_url, self.url)
-            self.assertTrue(self.app.is_running)
-            # 使用手动粘贴的同一 URL，走真实登录 -> 读任务 -> 查询 -> 下载路径。
-            sample = pd.read_excel(ROOT / PLAN["output_file"], sheet_name="库存参数", dtype=str).iloc[[0]]
-            with patch.object(APP.pd, "read_excel", return_value={"库存参数": sample}):
-                await self.app._run_with_stop(str(ROOT / PLAN["output_file"]), directory)
-            files = list(Path(directory).glob("*.xlsx"))
-            self.assertEqual(len(files), 1, "manual URL should lead to an actual report download")
-            results_path = next(Path(directory).glob("下载结果_*.csv"))
-            with results_path.open(encoding="utf-8-sig", newline="") as stream:
-                results = list(csv.DictReader(stream))
-            self.assertEqual([row["状态"] for row in results], ["成功"])
-            self.assertNotIn("local-test-token", results_path.read_text(encoding="utf-8-sig"))
+            original = Path(directory) / 'existing.xlsx'
+            original.write_bytes(b'earlier-user-report')
+            with self.assertRaises(FileExistsError):
+                await self.app._export_and_save(self.page, directory, 'existing', '库存', False)
+            self.assertEqual(original.read_bytes(), b'earlier-user-report')
+            self.assertFalse(list(Path(directory).glob('*.part')))
 
-    async def test_stop_closes_inflight_browser(self):
-        closed = asyncio.Event()
-        class Browser:
-            async def close(self): closed.set()
-        async def pending(*args):
-            self.app._active_browser = Browser()
-            await closed.wait()
-        self.app._run_automation = pending
-        run = asyncio.create_task(self.app._run_with_stop("unused", "unused"))
-        await asyncio.sleep(0.05)
-        APP.stop_flag = True
-        await asyncio.wait_for(run, timeout=2)
-        self.assertTrue(closed.is_set())
+    async def test_income_and_expense_city_province_fields_and_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for kind in ('收入', '支出'):
+                await self.page.goto(self.url + '&kind=' + kind)
+                self.app.current_nav_type = None
+                for province in (False, True):
+                    raw = dict(APP.REPORT_CONFIGS[kind]['sample'])
+                    raw.update({'报表类型': '1 -- 日', '起始日期': '20260801', '终止日期': '20260831',
+                                '国库选择': '1000000000' if province else '1015000000', '预算级次': '0',
+                                '辖属标志': '1 -- 本级' if province else '0 -- 全辖',
+                                '展示范围': '1 -- 下级' if province else '0 -- 全部', '金额单位': '0 -- 元',
+                                '分地区': '1'})
+                    raw['预算科目'] = ('T01,T010401,1050402' if province else 'T01,T010401,1101102') if kind == '收入' else 'T02,T020401,205,208,210,221,222'
+                    row = normalize_task_row(pd.Series(raw).rename(index=APP.COLUMN_MAPPING))
+                    await self.app._navigate_sidebar_smart(self.page, kind)
+                    await self.app._fill_form(self.page, row, kind)
+                    for category in ('dropdown_fields', 'date_fields', 'text_fields'):
+                        for field in APP.REPORT_CONFIGS[kind][category]:
+                            self.assertEqual(await self.page.locator('.el-form-item:has(label[for="%s"]) input' % field).input_value(), row[field])
+                    for label in APP.REPORT_CONFIGS[kind]['checkbox_fields']:
+                        checkbox = self.page.locator('label.el-checkbox').filter(has_text=label)
+                        self.assertEqual('is-checked' in await checkbox.get_attribute('class'), row[label] == '1')
+                    await self.app._click_query_and_wait(self.page, kind, timeout_seconds=3)
+                    name = kind + ('-province' if province else '-city')
+                    saved = await self.app._export_and_save(self.page, directory, name, kind, False)
+                    self.assertEqual(Path(saved).read_bytes(), (ROOT / PLAN['output_file']).read_bytes())
+            self.assertEqual(len(list(Path(directory).glob('*.xlsx'))), 4)
+
+    async def until(self, predicate, timeout=90):
+        async def wait():
+            while not predicate():
+                await asyncio.sleep(0.03)
+        await asyncio.wait_for(wait(), timeout)
+
+    async def test_login_first_pause_append_continue_keeps_browser_and_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = QueueStore(root / 'state')
+            events = []
+            session = BrowserSession(APP.ReportEngine, lambda *args: None, headless=True, query_timeout=3)
+            controller = QueueController(store, session, APP.REPORT_CONFIGS, APP.COLUMN_MAPPING, APP.ReportEngine,
+                                         lambda event, **data: events.append(dict(data, event=event)))
+            runner = asyncio.create_task(controller.serve())
+            try:
+                await controller.login(self.url, self.browser_path)
+                self.assertTrue(session.ready)
+                self.assertEqual(store.tasks(), [])
+                browser = session.browser
+                with patch('tmis_service.parse_parameter_file', return_value=plan_fixture(1, 'first')):
+                    await controller.import_files(['first.xlsx'], root, OPTIONS)
+                await controller.start()
+                await self.until(lambda: any(r['stage'] == '填写参数' for r in store.tasks()))
+                await controller.pause()
+                with patch('tmis_service.parse_parameter_file', return_value=plan_fixture(1, 'appended')):
+                    await controller.import_files(['appended.xlsx'], root, OPTIONS)
+                await self.until(lambda: controller.current is None)
+                self.assertEqual(store.counts(), {'pending': 1, 'succeeded': 1})
+                self.assertEqual(controller.mode, 'paused')
+                self.assertTrue(browser.is_connected())
+                await controller.start()
+                await self.until(lambda: controller.mode == 'idle' and store.counts().get('succeeded') == 2)
+                self.assertIs(session.browser, browser)
+                self.assertFalse(runner.done())
+                for row in store.tasks():
+                    self.assertEqual(Path(row['saved_path']).read_bytes(), (ROOT / PLAN['output_file']).read_bytes())
+                    self.assertEqual(row['attempt_count'], 1)
+                self.assertEqual(len({r['output_dir'] for r in store.tasks()}), 2)
+                self.assertNotIn('local-test-token', '\n'.join(store.connection.iterdump()))
+                self.assertNotIn('local-test-token', json.dumps(events, default=str))
+                for batch in store.batches():
+                    with (Path(batch['output_dir']) / '下载结果.csv').open(encoding='utf-8-sig', newline='') as stream:
+                        self.assertEqual(next(csv.DictReader(stream))['状态'], '成功')
+            finally:
+                await controller.shutdown()
+                await asyncio.wait_for(runner, 20)
+                self.assertFalse(session.ready)
+                self.assertIsNone(session.browser)
+                store.close()
+
+    async def test_timeout_retry_uses_same_browser_and_retains_both_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = QueueStore(root / 'state')
+            session = BrowserSession(APP.ReportEngine, lambda *args: None, headless=True, query_timeout=0.5)
+            controller = QueueController(store, session, APP.REPORT_CONFIGS, APP.COLUMN_MAPPING, APP.ReportEngine, lambda *args, **kwargs: None)
+            runner = asyncio.create_task(controller.serve())
+            original_query = session.engine._click_query_and_wait
+            modes = iter(['disabled', 'normal'])
+            async def query(page, kind, **kwargs):
+                mode = next(modes)
+                await page.evaluate('(mode) => window.queryMode=mode', mode)
+                await original_query(page, kind, timeout_seconds=0.5 if mode == 'disabled' else 3)
+            session.engine._click_query_and_wait = query
+            try:
+                await controller.login(self.url, self.browser_path)
+                browser = session.browser
+                store.add_batch(plan_fixture(1), root)
+                await controller.start()
+                await self.until(lambda: controller.mode == 'idle' and store.counts().get('timed_out') == 1)
+                self.assertFalse(list(root.glob('**/*.xlsx')))
+                await controller.retry()
+                await self.until(lambda: controller.mode == 'idle' and store.counts().get('succeeded') == 1)
+                task = store.tasks()[0]
+                self.assertEqual([a['status'] for a in store.history(task['id'])], ['timed_out', 'succeeded'])
+                self.assertTrue(Path(task['saved_path']).is_file())
+                self.assertIs(session.browser, browser)
+                await session.page.set_content('<input type="password">')
+                with self.assertRaises(SessionExpired):
+                    await session.check()
+                await controller.login(self.url, self.browser_path)
+                self.assertTrue(session.ready)
+                await session.browser.close()
+                self.assertFalse(session.ready)
+            finally:
+                await controller.shutdown()
+                await asyncio.wait_for(runner, 20)
+                store.close()
 
 
 if __name__ == "__main__":
