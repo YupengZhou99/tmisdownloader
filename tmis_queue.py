@@ -134,7 +134,7 @@ class DuplicateBatch(ValueError):
 class QueueStore:
     """Thread-safe transactions + a process lock prevent concurrent consumers."""
 
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, backup_legacy=False):
         self.directory = Path(directory) if directory is not None else default_state_dir()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = threading.RLock()
@@ -157,6 +157,20 @@ class QueueStore:
             raise RuntimeError('此任务库已被另一个程序占用，请关闭另一个窗口后再启动') from error
         try:
             self.connection = sqlite3.connect(str(self.directory / 'queue.sqlite3'), timeout=15, check_same_thread=False)
+            # Hold the same queue lock before taking a consistent SQLite backup,
+            # including WAL contents, and before recovering interrupted tasks.
+            backup = self.directory / 'queue.pre-workspaces.sqlite3'
+            if backup_legacy and not backup.exists() and self.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone():
+                temporary = self.directory / ('queue.backup-' + uuid4().hex + '.sqlite3')
+                try:
+                    with sqlite3.connect(str(temporary)) as target:
+                        self.connection.backup(target)
+                    temporary.chmod(0o600)
+                    os.replace(str(temporary), str(backup))
+                finally:
+                    if temporary.exists():
+                        temporary.unlink()
             self.connection.row_factory = sqlite3.Row
             self.connection.execute('PRAGMA foreign_keys=ON')
             self.connection.execute('PRAGMA journal_mode=WAL')

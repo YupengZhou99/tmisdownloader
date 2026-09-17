@@ -45,7 +45,7 @@ class DesktopAPI:
                     mode=c.mode, current=c.current, session_ready=c.session.ready,
                     headless=c.session.headless, pending_headless=c.pending_headless,
                     switching=bool(c.mode_job), importing=bool(c.import_jobs),
-                    state_dir=str(self.store.directory), version='6.0.0')
+                    state_dir=str(self.store.directory), version='6.1.0')
 
     async def preview(self, paths, options):
         if not isinstance(paths, list) or not 1 <= len(paths) <= 30:
@@ -65,7 +65,7 @@ class DesktopAPI:
                 self.previews[key] = (time.monotonic(), plan)
                 dates = [r['params']['pStartDate'] for r in plan['rows']]
                 ends = [r['params']['pEndDate'] for r in plan['rows']]
-                result.append(dict(id=key, name=plan['source_name'], count=len(plan['rows']),
+                result.append(dict(id=key, name=plan['source_name'], fingerprint=plan['fingerprint'], count=len(plan['rows']),
                                    kinds=dict(Counter(r['kind'] for r in plan['rows'])),
                                    start=min(dates), end=max(ends), duplicate=plan['fingerprint'] in known,
                                    sample=plan['rows'][:3]))
@@ -109,7 +109,7 @@ class DesktopAPI:
         fields = {
             'snapshot': (), 'preview': ('paths', 'options'), 'import_preview': ('ids', 'root', 'allow_duplicate'),
             'discard_preview': ('ids',), 'details': ('id',), 'login': ('url', 'browser_path'),
-            'start': (), 'pause': (), 'retry': ('ids',), 'remove': ('ids',),
+            'start': (), 'pause': (), 'disconnect': (), 'retry': ('ids',), 'remove': ('ids',),
             'request_mode': ('headless',), 'cancel_mode': (), 'browser_window': ('action',), 'shutdown': (),
         }
         if command not in fields or any(k not in fields[command] for k in data):
@@ -151,7 +151,7 @@ async def run():
             protocol.flush()
         except (BrokenPipeError, OSError):
             pass
-    store = QueueStore()
+    store = QueueStore(backup_legacy=os.environ.get('TMIS_BACKUP_LEGACY') == '1')
     app = load_engine()
     def emit(event, **data):
         send(dict(event=event, **data))
@@ -184,7 +184,7 @@ async def run():
         except Exception as error:
             send(dict(id=request_id, error=redact_urls(error)))
     consumer = asyncio.create_task(controller.serve())
-    send(dict(event='ready', version='6.0.0'))
+    send(dict(event='ready', version='6.1.0'))
     try:
         while not controller.closing and not consumer.done():
             reading = asyncio.create_task(incoming.get())

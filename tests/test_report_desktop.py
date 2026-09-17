@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -145,6 +146,45 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerProcessTests(unittest.TestCase):
+    def test_legacy_backup_precedes_recovery_and_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = QueueStore(directory)
+            batch = store.add_batch(plan_fixture(2), directory)
+            succeeded = store.claim_next()
+            store.finish(succeeded['id'], 'succeeded', saved_path='already-downloaded.xlsx')
+            interrupted = store.claim_next()
+            store.close()
+            upgraded = QueueStore(directory, backup_legacy=True)
+            backup = Path(directory) / 'queue.pre-workspaces.sqlite3'
+            with sqlite3.connect(str(backup)) as copy:
+                self.assertEqual(copy.execute('SELECT status FROM tasks WHERE id=?', (interrupted['id'],)).fetchone()[0], 'running')
+                self.assertEqual(copy.execute('SELECT status FROM tasks WHERE id=?', (succeeded['id'],)).fetchone()[0], 'succeeded')
+            self.assertEqual(upgraded.counts(), {'interrupted': 1, 'succeeded': 1})
+            original = backup.read_bytes()
+            with self.assertRaises(RuntimeError):
+                QueueStore(directory, backup_legacy=True)
+            upgraded.close()
+            again = QueueStore(directory, backup_legacy=True)
+            again.close()
+            self.assertEqual(backup.read_bytes(), original)
+
+    def test_disconnect_keeps_queue_store_usable(self):
+        async def check():
+            with tempfile.TemporaryDirectory() as directory:
+                store = QueueStore(directory)
+                session = ModeSession()
+                controller = QueueController(store, session, APP.REPORT_CONFIGS, APP.COLUMN_MAPPING, APP.ReportEngine, lambda *a, **k: None)
+                store.add_batch(plan_fixture(1), directory)
+                controller.current = 'busy'
+                with self.assertRaises(ValueError):
+                    await controller.disconnect()
+                controller.current = None
+                await controller.disconnect()
+                self.assertEqual(store.counts(), {'pending': 1})
+                self.assertFalse(session.ready)
+                store.close()
+        asyncio.run(check())
+
     def test_stdio_protocol_and_eof_release_queue_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, TMIS_STATE_DIR=directory, PYTHONUNBUFFERED='1')

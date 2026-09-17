@@ -4,6 +4,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const { WorkerBridge, redact } = require('./bridge.cjs');
+const { WorkspaceManager } = require('./workspaces.cjs');
 
 if (process.env.TMIS_DESKTOP_DATA_DIR) {
   fs.mkdirSync(process.env.TMIS_DESKTOP_DATA_DIR, { recursive: true });
@@ -14,8 +15,8 @@ if (process.platform === 'linux') app.commandLine.appendSwitch('ozone-platform',
 const pageURL = pathToFileURL(path.join(__dirname, '../dist/index.html')).href;
 const devURL = !app.isPackaged && process.env.TMIS_DEV_URL === 'http://127.0.0.1:5173' ? process.env.TMIS_DEV_URL : null;
 const allowedFiles = new Set(), allowedRoots = new Set();
-let mainWindow, floatWindow, bridge, snapshot, quitting = false, asking = false, compact = false;
-let refreshTimer, refreshing = false, refreshAgain = false, blocker, prefs = {}, logs = [];
+let mainWindow, floatWindow, manager, snapshot, quitting = false, asking = false, compact = false;
+let refreshTimer, blocker, prefs = {};
 const windows = () => [mainWindow, floatWindow].filter(win => win && !win.isDestroyed());
 const broadcast = message => windows().forEach(win => win.webContents.send('tmis:event', message));
 const prefsPath = () => path.join(app.getPath('userData'), 'window-preferences.json');
@@ -27,17 +28,12 @@ function authorize(event) {
   if (url !== pageURL && url !== devURL + '/') throw new Error('不受信任的页面');
 }
 async function refresh() {
-  if (!bridge || bridge.closed || quitting) return;
-  if (refreshing) { refreshAgain = true; return; }
-  refreshing = true;
-  try {
-    snapshot = await bridge.call('snapshot');
-    broadcast({ event: 'snapshot', data: snapshot });
-    const active = ['running', 'pausing', 'logging_in', 'switching'].includes(snapshot.mode);
-    if (active && blocker === undefined) blocker = powerSaveBlocker.start('prevent-app-suspension');
-    if (!active && blocker !== undefined) { powerSaveBlocker.stop(blocker); blocker = undefined; }
-  } catch (error) { broadcast({ event: 'error', message: redact(error.message) }); }
-  finally { refreshing = false; if (refreshAgain) { refreshAgain = false; scheduleRefresh(); } }
+  if (!manager || quitting) return;
+  snapshot = manager.snapshot();
+  broadcast({ event: 'workspaces', data: snapshot });
+  const active = snapshot.workspaces.some(w => !w.archived && (w.busy || ['running', 'pausing', 'logging_in', 'switching'].includes(w.state.mode)));
+  if (active && blocker === undefined) blocker = powerSaveBlocker.start('prevent-app-suspension');
+  if (!active && blocker !== undefined) { powerSaveBlocker.stop(blocker); blocker = undefined; }
 }
 function scheduleRefresh() {
   if (refreshTimer) return;
@@ -46,7 +42,7 @@ function scheduleRefresh() {
 function safeBounds(bounds) {
   const area = screen.getDisplayMatching(bounds).workArea;
   return { x: Math.max(area.x, Math.min(bounds.x, area.x + area.width - 368)),
-    y: Math.max(area.y, Math.min(bounds.y, area.y + area.height - 264)) };
+    y: Math.max(area.y, Math.min(bounds.y, area.y + area.height - 420)) };
 }
 function setCompact(value) {
   compact = value;
@@ -57,10 +53,10 @@ function setCompact(value) {
 }
 function makeWindow(floating) {
   const bounds = floating && Number.isFinite(prefs.x) && Number.isFinite(prefs.y) ?
-    safeBounds({ x: prefs.x, y: prefs.y, width: 368, height: 264 }) : {};
+    safeBounds({ x: prefs.x, y: prefs.y, width: 368, height: 420 }) : {};
   const win = new BrowserWindow({
-    ...bounds, width: floating ? 368 : 1320, height: floating ? 264 : 850,
-    minWidth: floating ? 368 : 990, minHeight: floating ? 264 : 660,
+    ...bounds, width: floating ? 368 : 1380, height: floating ? 420 : 880,
+    minWidth: floating ? 368 : 990, minHeight: floating ? 420 : 660,
     frame: !floating, resizable: !floating, show: false, backgroundColor: '#f5f7fb',
     title: floating ? 'TMIS · 下载进度' : 'TMIS · 数据工作台',
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true,
@@ -106,8 +102,8 @@ async function confirmExit() {
   asking = true;
   const { response } = await dialog.showMessageBox(compact ? floatWindow : mainWindow, {
     type: 'question', title: '离开工作台', buttons: ['继续运行', '切换悬浮窗', '退出应用'],
-    defaultId: 0, cancelId: 0, message: '退出会关闭抓取浏览器和服务',
-    detail: '当前未完成任务会保存为中断状态，下次启动可恢复。若只是收起界面，请切换悬浮窗。'
+    defaultId: 0, cancelId: 0, message: '退出会关闭所有工作区的浏览器和服务',
+    detail: '所有队列都会保存，正在执行的任务标记为中断，下次启动可恢复。若只是收起界面，请切换悬浮窗。'
   });
   asking = false;
   if (response === 1) setCompact(true);
@@ -117,53 +113,70 @@ async function shutdown() {
   if (quitting) return;
   quitting = true;
   broadcast({ event: 'closing' });
-  if (bridge && !bridge.closed) {
-    try {
-      await bridge.call('shutdown', {}, 30000);
-      bridge.child.stdin.end();
-      await new Promise(resolve => {
-        if (bridge.closed) return resolve();
-        const timer = setTimeout(resolve, 20000);
-        bridge.child.once('exit', () => { clearTimeout(timer); resolve(); });
-      });
-    } catch {}
-    if (!bridge.closed) bridge.child.kill('SIGTERM');
-  }
+  if (manager) await manager.shutdown();
   if (blocker !== undefined) powerSaveBlocker.stop(blocker);
   app.quit();
 }
 const commands = new Set(['snapshot', 'preview', 'import_preview', 'discard_preview', 'details',
-  'login', 'start', 'pause', 'retry', 'remove', 'request_mode', 'cancel_mode', 'browser_window']);
-ipcMain.handle('tmis:call', async (event, command, data = {}) => {
+  'login', 'start', 'pause', 'disconnect', 'retry', 'remove', 'request_mode', 'cancel_mode', 'browser_window']);
+const grantKey = (id, value) => id + '\0' + value;
+function rootAllowed(id, root) { return typeof root === 'string' && path.isAbsolute(root) && (allowedRoots.has(grantKey(id, root)) || manager.get(id).meta.root === root); }
+ipcMain.handle('tmis:call', async (event, command, data = {}, workspaceId) => {
   authorize(event);
+  manager.get(workspaceId);
   if (!commands.has(command) || !data || typeof data !== 'object' || Array.isArray(data)) throw new Error('无效操作');
-  if (command === 'preview' && (!Array.isArray(data.paths) || data.paths.some(p => !allowedFiles.has(p))))
+  if (command === 'preview' && (!Array.isArray(data.paths) || data.paths.some(p => !allowedFiles.has(grantKey(workspaceId, p)))))
     throw new Error('请通过文件选择或拖放导入参数表');
-  if (command === 'import_preview' && !allowedRoots.has(data.root)) throw new Error('请先选择下载目录');
-  if (command === 'snapshot') return { ...await bridge.call(command), logs, top: prefs.top !== false };
-  const result = await bridge.call(command, data);
+  if (command === 'import_preview' && !rootAllowed(workspaceId, data.root)) throw new Error('请先为此工作区选择下载目录');
+  const result = await manager.call(workspaceId, command, data);
   scheduleRefresh();
   return result;
 });
-ipcMain.handle('tmis:files', async event => {
+ipcMain.handle('tmis:workspaces', async (event, action, data = {}) => {
   authorize(event);
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('无效工作区操作');
+  let result;
+  if (action === 'snapshot') return { ...manager.snapshot(), top: prefs.top !== false };
+  if (action === 'create') result = manager.create(data.name);
+  else if (action === 'update') {
+    if (data.settings && 'root' in data.settings && !rootAllowed(data.id, data.settings.root)) throw new Error('请先选择此工作区的保存目录');
+    result = manager.update(data.id, data.settings);
+  } else if (action === 'confirm') result = await manager.confirm(data.ids);
+  else if (action === 'archive') result = await manager.archive(data.id);
+  else if (action === 'restore') { manager.restore(data.id); await manager.ensure(data.id); }
+  else if (action === 'start_all' || action === 'pause_all') result = await manager.all(action === 'start_all' ? 'start' : 'pause');
+  else if (action === 'login_all') {
+    if (!Array.isArray(data.entries) || data.entries.length < 1 || data.entries.length > 4 || new Set(data.entries.map(e => e.id)).size !== data.entries.length) throw new Error('请选择 1～4 个不同工作区登录');
+    data.entries.forEach(e => manager.get(e.id));
+    result = await Promise.all(data.entries.map(async e => {
+      try { await manager.login(e.id, { url: e.url }); return { id: e.id, ok: true }; }
+      catch (error) { return { id: e.id, ok: false, error: redact(error.message) }; }
+    }));
+  } else throw new Error('未知工作区操作');
+  scheduleRefresh(); return result;
+});
+ipcMain.handle('tmis:files', async (event, id) => {
+  authorize(event);
+  manager.get(id);
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile', 'multiSelections'],
     filters: [{ name: 'Excel 参数表', extensions: ['xlsx', 'xls'] }] });
-  result.filePaths.forEach(p => allowedFiles.add(p));
+  result.filePaths.forEach(p => allowedFiles.add(grantKey(id, p)));
   return result.filePaths;
 });
-ipcMain.handle('tmis:drop', (event, files) => {
+ipcMain.handle('tmis:drop', (event, files, id) => {
   authorize(event);
+  manager.get(id);
   if (!Array.isArray(files) || files.length > 30 || files.some(p => typeof p !== 'string' || !path.isAbsolute(p) || !/\.xlsx?$/i.test(p) || !fs.statSync(p).isFile()))
     throw new Error('请拖入 Excel 参数表（一次最多 30 份）');
-  files.forEach(p => allowedFiles.add(p));
+  files.forEach(p => allowedFiles.add(grantKey(id, p)));
   return files;
 });
-ipcMain.handle('tmis:directory', async event => {
+ipcMain.handle('tmis:directory', async (event, id) => {
   authorize(event);
+  manager.get(id);
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory', 'createDirectory'] });
   const root = result.filePaths[0] || '';
-  if (root) allowedRoots.add(root);
+  if (root) allowedRoots.add(grantKey(id, root));
   return root;
 });
 ipcMain.handle('tmis:browser', async event => {
@@ -176,15 +189,18 @@ ipcMain.handle('tmis:window', (event, action, value) => {
   if (action === 'compact') setCompact(true);
   else if (action === 'expand') setCompact(false);
   else if (action === 'exit') void confirmExit();
+  else if (action === 'workspace' && typeof value === 'string') {
+    manager.get(value); setCompact(false); broadcast({ event: 'navigate', workspaceId: value });
+  }
   else if (action === 'top' && typeof value === 'boolean') {
     prefs.top = value; savePrefs(); floatWindow.setAlwaysOnTop(value);
     broadcast({ event: 'window', compact, top: value });
   } else throw new Error('未知窗口操作');
 });
-ipcMain.handle('tmis:open', async (event, target) => {
+ipcMain.handle('tmis:open', async (event, target, id) => {
   authorize(event);
-  const fresh = await bridge.call('snapshot');
-  const permitted = [...allowedRoots, fresh.state_dir, ...fresh.batches.map(b => b.output_dir)];
+  const fresh = await manager.call(id, 'snapshot');
+  const permitted = [manager.get(id).meta.root, fresh.state_dir, ...fresh.batches.map(b => b.output_dir)];
   if (typeof target !== 'string' || !permitted.includes(target)) throw new Error('只能打开已选择的输出目录或任务目录');
   const error = await shell.openPath(target);
   if (error) throw new Error(redact(error));
@@ -206,23 +222,20 @@ else {
     mainWindow = makeWindow(false);
     floatWindow = makeWindow(true);
     const root = path.resolve(__dirname, '../..');
-    const executable = app.isPackaged ? path.join(process.resourcesPath, 'backend/tmis-worker') :
-      (process.env.TMIS_PYTHON || path.join(root, '.venv/bin/python'));
-    const args = app.isPackaged ? [] : ['-u', path.join(root, 'tmis_worker.py')];
-    bridge = new WorkerBridge(spawn(executable, args, { cwd: app.isPackaged ? process.resourcesPath : root,
-      env: { ...process.env, PYTHONUTF8: '1', PYTHONUNBUFFERED: '1' }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
-    bridge.on('event', message => {
-      if (quitting && message.event === 'offline') return;
-      if (message.event === 'log') {
-        logs.push({ ...message, time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) });
-        logs = logs.slice(-300);
-      }
-      broadcast(message);
-      if (['ready', 'changed', 'status', 'completed'].includes(message.event)) scheduleRefresh();
-    });
+    manager = new WorkspaceManager({ createBridge: (_id, stateDir, legacy) => {
+      const executable = app.isPackaged ? path.join(process.resourcesPath, 'backend/tmis-worker') :
+        (process.env.TMIS_PYTHON || path.join(root, '.venv/bin/python'));
+      const args = app.isPackaged ? [] : ['-u', path.join(root, 'tmis_worker.py')];
+      return new WorkerBridge(spawn(executable, args, { cwd: app.isPackaged ? process.resourcesPath : root,
+        env: { ...process.env, TMIS_STATE_DIR: stateDir, TMIS_BACKUP_LEGACY: legacy ? '1' : '0', PYTHONUTF8: '1', PYTHONUNBUFFERED: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
+    } });
+    manager.on('event', message => { if (!quitting || message.event !== 'offline') broadcast(message); });
+    manager.on('change', scheduleRefresh);
+    void manager.initialize().then(scheduleRefresh);
     mainWindow.once('ready-to-show', () => mainWindow.show());
     mainWindow.webContents.on('did-finish-load', () => {
-      if (snapshot) broadcast({ event: 'snapshot', data: snapshot });
+      void refresh();
     });
   }).catch(error => { dialog.showErrorBox('启动失败', redact(error.message)); quitting = true; app.quit(); });
 }

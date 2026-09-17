@@ -1,7 +1,7 @@
 {
   "name": "tmis-workbench",
   "productName": "TMIS Workbench",
-  "version": "6.0.0",
+  "version": "6.1.0",
   "private": true,
   "description": "Offline TMIS report download workbench",
   "main": "electron/main.cjs",
@@ -11,7 +11,8 @@
     "start": "electron .",
     "install:runtime": "install-electron",
     "test": "node --test electron/*.test.cjs",
-    "smoke": "node scripts/smoke.cjs"
+    "smoke": "node scripts/smoke.cjs",
+    "smoke:workspaces": "node scripts/workspaces-smoke.cjs"
   },
   "dependencies": {
     "react": "19.2.7",

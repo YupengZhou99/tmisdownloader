@@ -17,7 +17,7 @@ let application;
 async function waitForState(page, predicate, timeout = 90000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const result = await page.evaluate(() => window.tmis.call('snapshot'));
+    const result = await page.evaluate(() => window.tmis.call('snapshot', {}, 'default'));
     if (predicate(result)) return result;
     await new Promise(resolve => setTimeout(resolve, 150));
   }
@@ -47,8 +47,8 @@ async function run() {
   assert.ok(main, 'main workbench window loaded');
   const pageErrors = [];
   main.on('pageerror', error => pageErrors.push(error.message));
-  await main.getByRole('heading', { name: '下载队列', exact: true }).waitFor();
-  await waitForState(main, state => state.version === '6.0.0');
+  await main.getByRole('heading', { name: '每一路，各司其职。', exact: true }).waitFor();
+  await waitForState(main, state => state.version === '6.1.0');
   await main.screenshot({ path: path.join(artifacts, 'workbench-empty.png') });
   // Native picker is stubbed in the isolated test process; subsequent user UI,
   // IPC validation, Python parsing, snapshots and downloads are real.
@@ -58,17 +58,15 @@ async function run() {
         [directory] : [directory + '/库存.xlsx']
     });
   }, config);
-  if (process.env.TMIS_TEST_BROWSER_PATH) {
-    await main.getByRole('button', { name: '偏好与浏览器', exact: true }).click();
-    await main.getByPlaceholder('默认使用随包浏览器 / 系统 Chrome').fill(process.env.TMIS_TEST_BROWSER_PATH);
-    await main.getByRole('button', { name: '完成', exact: true }).click();
-  }
-  await main.getByRole('button', { name: '连接 TMIS', exact: true }).click();
-  await main.getByPlaceholder('粘贴含登录信息的完整 http:// 或 https:// 链接').fill(config.url);
-  await main.getByRole('button', { name: '连接工作界面' }).click();
+  if (process.env.TMIS_TEST_BROWSER_PATH) await main.evaluate(browserPath => window.tmis.workspaces('update', { id: 'default', settings: { browserPath } }), process.env.TMIS_TEST_BROWSER_PATH);
+  await main.getByRole('button', { name: '批量登录与确认', exact: true }).click();
+  await main.getByRole('textbox', { name: '登录链接 默认工作区', exact: true }).fill(config.url);
+  await main.getByRole('button', { name: '全部登录', exact: true }).click();
   await waitForState(main, s => s.session_ready);
   process.stdout.write('PASS independent login\n');
-  assert.equal((await main.evaluate(() => window.tmis.call('snapshot'))).tasks.length, 0, 'login works before file selection');
+  assert.equal((await main.evaluate(() => window.tmis.call('snapshot', {}, 'default'))).tasks.length, 0, 'login works before file selection');
+  await main.getByRole('button', { name: '确认并配置任务', exact: true }).click();
+  await main.getByRole('button', { name: '进入队列 默认工作区', exact: true }).click();
   async function importFile(files = ['库存.xlsx']) {
     await application.evaluate(({ dialog }, { directory, files }) => {
       dialog.showOpenDialog = async (_window, options) => ({
@@ -86,8 +84,8 @@ async function run() {
   await main.screenshot({ path: path.join(artifacts, 'import-preview.png') });
   await main.getByRole('button', { name: '加入队列', exact: true }).click();
   process.stdout.write('PASS parameter preview and import\n');
-  assert.equal((await main.evaluate(() => window.tmis.call('snapshot'))).tasks.length, 3);
-  await main.getByRole('button', { name: '开始 / 继续' }).click();
+  assert.equal((await main.evaluate(() => window.tmis.call('snapshot', {}, 'default'))).tasks.length, 3);
+  await main.getByRole('button', { name: '开始本队列' }).click();
   await waitForState(main, s => !!s.current);
   const pid = await application.evaluate(() => process.pid);
   await main.getByRole('button', { name: '悬浮窗', exact: true }).click();
@@ -103,7 +101,7 @@ async function run() {
   await main.getByRole('button', { name: '完成', exact: true }).click();
   await importFile(['追加1.xlsx', '追加2.xlsx']);
   await main.getByRole('button', { name: '加入队列', exact: true }).click();
-  assert.equal((await main.evaluate(() => window.tmis.call('snapshot'))).tasks.length, 5);
+  assert.equal((await main.evaluate(() => window.tmis.call('snapshot', {}, 'default'))).tasks.length, 5);
   const finished = await waitForState(main, s => s.counts.succeeded === 5 && s.mode === 'idle', 180000);
   assert.equal(finished.headless, true);
   assert.equal(finished.session_ready, true, 'session kept alive after queue completion');
@@ -114,25 +112,26 @@ async function run() {
   }
   await main.screenshot({ path: path.join(artifacts, 'workbench-completed.png') });
   // Retry a successful row is ignored, never downloaded again.
-  await main.evaluate(id => window.tmis.call('retry', { ids: [id] }), finished.tasks[0].id);
-  const after = await main.evaluate(() => window.tmis.call('snapshot'));
+  await main.evaluate(id => window.tmis.call('retry', { ids: [id] }, 'default'), finished.tasks[0].id);
+  const after = await main.evaluate(() => window.tmis.call('snapshot', {}, 'default'));
   assert.equal(after.tasks[0].attempt_count, 1);
   assert.equal(after.counts.succeeded, 5);
   await importFile(['重试.xlsx']);
   await main.getByRole('button', { name: '加入队列', exact: true }).click();
   const control = new URL('/__test/fail-next', config.url);
   assert.ok((await fetch(control)).ok);
-  await main.getByRole('button', { name: '开始 / 继续' }).click();
+  await main.getByRole('button', { name: '开始本队列' }).click();
   const failed = await waitForState(main, s => s.counts.failed === 1 && s.mode === 'idle');
   await main.getByRole('button', { name: '重试', exact: true }).click();
   const recovered = await waitForState(main, s => s.counts.succeeded === 6 && s.mode === 'idle');
   const retried = recovered.tasks.find(task => task.output_name === '失败后重试');
   assert.equal(retried.attempt_count, 2);
-  const details = await main.evaluate(id => window.tmis.call('details', { id }), retried.id);
+  const details = await main.evaluate(id => window.tmis.call('details', { id }, 'default'), retried.id);
   assert.deepEqual(details.history.map(item => item.status), ['failed', 'succeeded']);
   process.stdout.write('PASS failed-row retry with preserved history\n');
   await main.getByRole('button', { name: '下载队列', exact: true }).click();
-  await main.screenshot({ path: path.join(artifacts, 'workbench-completed.png') });
+  await main.getByRole('heading', { name: '下载队列', exact: true }).waitFor();
+  await main.screenshot({ path: path.join(artifacts, 'workbench-completed.png'), animations: 'disabled' });
   assert.deepEqual(pageErrors, []);
   const report = { status: 'ok', platform: process.platform, arch: process.arch,
     electron: await application.evaluate(() => process.versions.electron), downloads: 6,
@@ -141,7 +140,7 @@ async function run() {
     failed_row_retry: true, packaged: !!packaged, temporary };
   fs.writeFileSync(path.join(artifacts, 'desktop-smoke.json'), JSON.stringify(report, null, 2));
   process.stdout.write(JSON.stringify(report) + '\n');
-  await main.evaluate(() => window.tmis.call('pause'));
+  await main.evaluate(() => window.tmis.call('pause', {}, 'default'));
   await application.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2 }); });
   await main.getByRole('button', { name: '退出应用', exact: true }).click();
   await new Promise((resolve, reject) => {

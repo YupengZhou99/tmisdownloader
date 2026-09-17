@@ -66,8 +66,10 @@ export TMIS_PLAYWRIGHT_NODE="$(python -c 'import pathlib,playwright;print(pathli
 export TMIS_DESKTOP_EXECUTABLE="$PWD/$task_bundle/tmis-workbench"
 # Only the synthetic root-container test uses this; the launcher keeps sandboxing.
 TMIS_CI_ROOT=1 xvfb-run -a node desktop/scripts/smoke.cjs
+TMIS_CI_ROOT=1 xvfb-run -a node desktop/scripts/workspaces-smoke.cjs
 cp output/playwright/desktop-smoke.json "$task_bundle/acceptance.json"
+cp output/playwright/workspaces-smoke.json "$task_bundle/workspaces-acceptance.json"
 cp DESKTOP_V6.md dist/使用说明.md
-cp output/playwright/desktop-smoke.json dist/验收结果.json
-tar -C dist -czf dist/TMIS-Workbench-V6-Kylin-x64.tar.gz TMIS-Workbench-Kylin-x64
-sha256sum dist/TMIS-Workbench-V6-Kylin-x64.tar.gz | sed 's@  dist/@  @' > dist/TMIS-Workbench-V6-Kylin-x64.tar.gz.sha256
+cp output/playwright/workspaces-smoke.json dist/验收结果.json
+tar -C dist -czf dist/TMIS-Workbench-V6.1-Kylin-x64.tar.gz TMIS-Workbench-Kylin-x64
+sha256sum dist/TMIS-Workbench-V6.1-Kylin-x64.tar.gz | sed 's@  dist/@  @' | tee dist/TMIS-Workbench-V6.1-Kylin-x64.tar.gz.sha256

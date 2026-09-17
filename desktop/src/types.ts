@@ -12,20 +12,24 @@ export type State = {
 };
 export type Preview = {
   id?: string; name: string; count?: number; start?: string; end?: string;
-  kinds?: Record<string, number>; duplicate?: boolean; error?: string;
+  kinds?: Record<string, number>; duplicate?: boolean; duplicate_workspaces?: string[]; error?: string;
   sample?: { kind: string; output_name: string; params: Record<string, string> }[];
 };
 export type Options = { start_date: string; end_date: string; naming_mode: string; postprocess: boolean };
+export type WorkspaceInfo = { id: string; name: string; root: string; folder: string; browserPath: string;
+  archived: boolean; online: boolean; confirmed: boolean; error: string; busy: string | null; worker_pid?: number | null; state: State; logs: Log[] };
+export type WorkspaceSnapshot = { version: string; limit: number; workspaces: WorkspaceInfo[]; closing: boolean; top?: boolean };
 declare global {
   interface Window {
     tmis?: {
-      call: <T = unknown>(command: string, data?: object) => Promise<T>;
-      files: () => Promise<string[]>;
-      directory: () => Promise<string>;
+      call: <T = unknown>(command: string, data?: object, workspaceId?: string) => Promise<T>;
+      workspaces: <T = unknown>(action: string, data?: object) => Promise<T>;
+      files: (workspaceId?: string) => Promise<string[]>;
+      directory: (workspaceId?: string) => Promise<string>;
       browser: () => Promise<string>;
-      drop: (files: File[]) => Promise<string[]>;
-      window: (action: string, value?: boolean) => Promise<void>;
-      open: (path: string) => Promise<void>;
+      drop: (files: File[], workspaceId?: string) => Promise<string[]>;
+      window: (action: string, value?: boolean | string) => Promise<void>;
+      open: (path: string, workspaceId?: string) => Promise<void>;
       subscribe: (callback: (data: Record<string, any>) => void) => () => void;
     };
   }

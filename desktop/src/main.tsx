@@ -4,12 +4,13 @@ import { Activity, ArrowDownToLine, ArrowLeft, ArrowUpRight, Check, CheckCircle2
   ChevronLeft, ChevronRight, CircleAlert, Clock3, FileSpreadsheet, Files, FolderOpen, Grip,
   LayoutDashboard, Link, ListFilter, LoaderCircle, LogOut, Maximize2, Minus, Monitor, MoreHorizontal,
   PanelTop, Pause, Pin, Play, Plus, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
-import type { State, Task, Preview, Options, Log } from './types';
+import type { State, Task, Preview, Options, Log, WorkspaceInfo } from './types';
+import WorkspaceHub from './WorkspaceHub';
 import './style.css';
 
 const empty: State = { tasks: [], batches: [], counts: {}, mode: 'idle', current: null,
   session_ready: false, headless: false, pending_headless: null, switching: false,
-  importing: false, state_dir: '', version: '6.0.0' };
+  importing: false, state_dir: '', version: '6.1.0' };
 const statusName: Record<string, string> = { pending: '待执行', running: '执行中', succeeded: '已完成',
   failed: '失败', timed_out: '超时', interrupted: '待恢复', cancelled: '已移除' };
 const modeName: Record<string, string> = { idle: '服务待命', running: '正在执行', paused: '队列已暂停',
@@ -20,14 +21,26 @@ const shortName = (path: string) => path.split(/[\\/]/).pop() || path;
 const errorText = (error: unknown) => error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : String(error);
 const compactView = new URLSearchParams(location.search).get('view') === 'compact';
 function Badge({ status }: { status: string }) { return <span className={'badge ' + status}><i/>{statusName[status] || status}</span>; }
-function App() {
-  const api = window.tmis;
-  const [state, setState] = useState<State>(empty), [tab, setTab] = useState('queue');
-  const [logs, setLogs] = useState<Log[]>([]), [offline, setOffline] = useState(!api), [closing, setClosing] = useState(false);
+function Workspace({ workspace, overview, manage, switchTo, workspaces }: { workspace: WorkspaceInfo; overview: () => void; manage: () => void; switchTo: (id: string) => void; workspaces: WorkspaceInfo[] }) {
+  // Capture the workspace ID in every picker, request and subscription. A later
+  // tab switch can never redirect an in-flight preview/import to another queue.
+  const api = useMemo(() => {
+    const raw = window.tmis, id = workspace.id;
+    return raw ? { ...raw,
+      call: <T,>(command: string, data = {}) => raw.call<T>(command, data, id),
+      files: () => raw.files(id), directory: () => raw.directory(id),
+      drop: (files: File[]) => raw.drop(files, id), open: (path: string) => raw.open(path, id),
+      subscribe: (listener: (data: Record<string, any>) => void) => raw.subscribe(event => {
+        if (event.workspaceId === id || ['window', 'closing'].includes(event.event)) listener(event);
+      })
+    } : undefined;
+  }, [workspace.id]);
+  const [state, setState] = useState<State>(workspace.state || empty), [tab, setTab] = useState('queue');
+  const [logs, setLogs] = useState<Log[]>(workspace.logs || []), [offline, setOffline] = useState(!workspace.online), [closing, setClosing] = useState(false);
   const [toast, setToast] = useState(''), [completion, setCompletion] = useState<Record<string, number> | null>(null);
   const [modal, setModal] = useState<'login' | 'import' | 'settings' | null>(null), [busy, setBusy] = useState('');
-  const [url, setUrl] = useState(''), [browserPath, setBrowserPath] = useState(''), [top, setTop] = useState(true);
-  const [paths, setPaths] = useState<string[]>([]), [root, setRoot] = useState(''), [previews, setPreviews] = useState<Preview[]>([]);
+  const [url, setUrl] = useState(''), [browserPath, setBrowserPath] = useState(workspace.browserPath || ''), [top, setTop] = useState(true);
+  const [paths, setPaths] = useState<string[]>([]), [root, setRoot] = useState(workspace.root || ''), [previews, setPreviews] = useState<Preview[]>([]);
   const [duplicate, setDuplicate] = useState(false), [options, setOptions] = useState<Options>({ start_date: '', end_date: '', naming_mode: 'param', postprocess: false });
   const [search, setSearch] = useState(''), [kind, setKind] = useState(''), [batch, setBatch] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set()), [page, setPage] = useState(0);
@@ -65,6 +78,11 @@ function App() {
   }, []);
   useEffect(() => { setPage(0); setSelected(new Set()); }, [tab, search, kind, batch]);
   useEffect(() => {
+    setOffline(!workspace.online);
+    setState(workspace.state);
+    setLogs(workspace.logs);
+  }, [workspace.online, workspace.state, workspace.logs]);
+  useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(''), 10000);
     return () => clearTimeout(timer);
@@ -90,6 +108,7 @@ function App() {
   const current = state.tasks.find(t => t.id === state.current);
   const running = ['running', 'pausing'].includes(state.mode);
   const locked = offline || closing;
+  const configureLocked = locked || !workspace.confirmed;
   const filtered = useMemo(() => state.tasks.filter(task =>
     (tab !== 'failed' || retryable(task)) && (!kind || task.kind === kind) && (!batch || task.batch_id === batch) &&
     (!search || [task.output_name, task.source_name, task.treasury, task.start, statusName[task.status]].join(' ').toLowerCase().includes(search.toLowerCase()))
@@ -133,9 +152,9 @@ function App() {
       setCompletion(null);
     }
   }
-  const startPause = <button className={'btn ' + (running ? 'soft' : 'primary')} disabled={locked || !!busy || state.mode === 'pausing'}
+  const startPause = <button className={'btn ' + (running ? 'soft' : 'primary')} disabled={configureLocked || !!busy || state.mode === 'pausing'}
     onClick={() => { setCompletion(null); void command(running ? 'pause' : 'start'); }}>
-    {running ? <Pause size={16}/> : <Play size={16}/>} {running ? (state.mode === 'pausing' ? '等待暂停' : '暂停队列') : '开始 / 继续'}</button>;
+    {running ? <Pause size={16}/> : <Play size={16}/>} {running ? (state.mode === 'pausing' ? '等待暂停' : '暂停本队列') : '开始本队列'}</button>;
   const showWindow = (action: string, value?: boolean) => void attempt('window', async () => api?.window(action, value));
   const modeNotice = state.pending_headless !== null || state.switching;
 
@@ -154,10 +173,12 @@ function App() {
 
   return <div className="shell" onDragOver={event => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); setDragging(true); } }}
     onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }}
-    onDrop={event => { event.preventDefault(); setDragging(false); if (!locked && !busy) void chooseFiles(Array.from(event.dataTransfer.files)); }}>
+    onDrop={event => { event.preventDefault(); setDragging(false); if (!configureLocked && !busy) void chooseFiles(Array.from(event.dataTransfer.files)); }}>
     <aside className="sidebar">
-      <div className="brand"><span className="logo"><ArrowDownToLine size={24}/></span><div><b>TMIS</b><span>数据工作台</span></div><span className="version">6.0</span></div>
-      <div className="sidebar-caption">工作空间</div>
+      <div className="brand"><span className="logo"><ArrowDownToLine size={24}/></span><div><b>TMIS</b><span>数据工作台</span></div><span className="version">6.1</span></div>
+      <button className="nav" onClick={overview}><ArrowLeft size={18}/>所有工作区</button>
+      <div className="workspace-selector"><label>当前独立队列<select aria-label="切换工作区" value={workspace.id} onChange={e => switchTo(e.target.value)}>{workspaces.map(w => <option value={w.id} key={w.id}>{w.name}</option>)}</select></label></div>
+      <div className="sidebar-caption">{workspace.name}</div>
       <nav>
         {[['queue', LayoutDashboard, '下载队列'], ['failed', CircleAlert, '待处理任务'], ['batches', Files, '参数表批次'], ['logs', Activity, '运行日志']].map(([key, Icon, label]) => {
           const I = Icon as typeof Files;
@@ -174,10 +195,11 @@ function App() {
       <header className="topbar"><span>工作空间 <ChevronRight size={14}/> {({ queue: '下载队列', failed: '待处理任务', batches: '参数表批次', logs: '运行日志' } as Record<string, string>)[tab]}</span>
         <div className="topbar-right"><span className="local-label"><ShieldCheck size={14}/> 本机运行</span><button className="btn" onClick={() => showWindow('compact')} title="Ctrl / ⌘ + Shift + M"><PanelTop size={16}/>悬浮窗</button></div></header>
       <main>
-        <div className="page-heading"><div><div className="eyebrow">TMIS REPORT WORKSPACE</div><h1>{({ queue: '下载队列', failed: '待处理任务', batches: '参数表批次', logs: '运行日志' } as Record<string, string>)[tab]}</h1>
+        <div className="page-heading"><div><div className="eyebrow">{workspace.name} / INDEPENDENT QUEUE</div><h1>{({ queue: '下载队列', failed: '待处理任务', batches: '参数表批次', logs: '运行日志' } as Record<string, string>)[tab]}</h1>
           <p>让报表下载，有条不紊。{tab === 'queue' ? ' 收入、支出、库存，自由查询一站管理。' : ' 每一次执行都有记录，每一个任务都可追溯。'}</p></div>
-          <button className="btn primary" disabled={locked || !!busy} onClick={() => setModal('import')}><Plus size={17}/>添加参数表</button></div>
-        {offline && <div className="notice danger"><CircleAlert size={18}/>{api ? '后台服务已停止。请退出后重新打开应用；已保存的任务不会丢失。' : '当前为浏览器外观预览，下载、文件选择和窗口控制仅在桌面应用中可用。'}</div>}
+          <button className="btn primary" disabled={configureLocked || !!busy} onClick={() => setModal('import')}><Plus size={17}/>添加参数表</button></div>
+        {!workspace.confirmed && <div className="notice warning"><Link size={18}/><span>此工作区尚未完成本轮登录确认，已有队列仅供查看。</span><button className="text-button" onClick={manage}>登录并确认全部会话</button></div>}
+        {offline && <div className="notice danger"><CircleAlert size={18}/>{api ? '此工作区后台尚未连接或已停止。请重新登录恢复本队列；其他工作区不受影响，已保存的任务不会丢失。' : '当前为浏览器外观预览，下载、文件选择和窗口控制仅在桌面应用中可用。'}</div>}
         {closing && <div className="notice"><LoaderCircle className="spin" size={18}/>正在保存任务并关闭浏览器，请稍候…</div>}
         {completion && <div className={'notice ' + (completion.failed || completion.timed_out ? 'warning' : 'success')}><CheckCircle2 size={18}/>
           <span>本轮已结束：成功 {completion.succeeded || 0} 条，失败 / 超时 {(completion.failed || 0) + (completion.timed_out || 0)} 条。浏览器和服务保持开启。</span>
@@ -193,7 +215,7 @@ function App() {
           <div className="control-main"><div className={'session-icon ' + (state.session_ready ? 'connected' : '')}><Monitor size={23}/></div>
             <div className="session-text"><b>{state.session_ready ? 'TMIS 会话已就绪' : state.mode === 'logging_in' ? '正在连接 TMIS…' : '先登录，随时开始'}</b>
               <span>{state.session_ready ? (state.headless ? '无头模式 · 浏览器在后台执行' : '有头模式 · 可查看浏览器页面') : '粘贴登录链接即可连接，无需先选择参数表。'}</span></div>
-            <button className="btn" disabled={locked || !!state.current || state.switching || state.pending_headless !== null || state.mode === 'logging_in'} onClick={() => setModal('login')}><Link size={15}/>{state.session_ready ? '重新登录' : '连接 TMIS'}</button>
+            <button className="btn" disabled={!!state.current || state.switching || state.pending_headless !== null || state.mode === 'logging_in'} onClick={() => workspace.confirmed ? setModal('login') : manage()}><Link size={15}/>{state.session_ready ? '重新登录' : '连接 TMIS'}</button>
             <button className="icon-button" aria-label="浏览器设置" onClick={() => setModal('settings')}><MoreHorizontal size={20}/></button>
             <span className="vertical-line"/>{startPause}</div>
           <div className="execution-line"><span className={'live-dot ' + (running ? 'active' : '')}/><b>{modeName[state.mode]}</b>
@@ -207,10 +229,10 @@ function App() {
           <div className="panel-toolbar"><div className="search"><Search size={16}/><input aria-label="搜索任务" placeholder="搜索文件名称、国库代码或日期…" value={search} onChange={e => setSearch(e.target.value)}/></div>
             <select aria-label="报表类型" value={kind} onChange={e => setKind(e.target.value)}><option value="">全部报表</option>{['收入', '支出', '库存', '退库'].map(v => <option key={v}>{v}</option>)}</select>
             <select aria-label="参数批次" className="batch-filter" value={batch} onChange={e => setBatch(e.target.value)}><option value="">全部批次</option>{state.batches.map((b, i) => <option key={b.id} value={b.id}>{i + 1}. {b.source_name}</option>)}</select>
-            <span className="grow"/>{tab === 'failed' && <button className="btn" disabled={locked || !!busy || !failures} onClick={() => void command('retry', { ids: state.tasks.filter(retryable).map(t => t.id) })}><RefreshCw size={15}/>重试全部失败 / 中断</button>}
+            <span className="grow"/>{tab === 'failed' && <button className="btn" disabled={configureLocked || !!busy || !failures} onClick={() => void command('retry', { ids: state.tasks.filter(retryable).map(t => t.id) })}><RefreshCw size={15}/>重试本队列全部失败 / 中断</button>}
           </div>
           {selected.size > 0 && <div className="selection-bar"><b>已选 {selected.size} 条</b>
-            <button className="text-button" disabled={locked || !!busy || !selection.some(retryable)} onClick={() => void command('retry', { ids: selection.filter(retryable).map(t => t.id) })}>重试所选失败 / 中断</button>
+            <button className="text-button" disabled={configureLocked || !!busy || !selection.some(retryable)} onClick={() => void command('retry', { ids: selection.filter(retryable).map(t => t.id) })}>重试所选失败 / 中断</button>
             <button className="text-button" disabled={locked || !!busy || !selection.some(t => ['pending', 'interrupted'].includes(t.status))} onClick={() => {
               if (confirm('仅移除选中的待执行 / 中断任务，历史记录保留。是否继续？')) void command('remove', { ids: selection.map(t => t.id) });
             }}>移除待执行任务</button><button className="text-button" onClick={() => setSelected(new Set())}>取消选择</button></div>}
@@ -222,11 +244,11 @@ function App() {
                 <small title={task.source_name}>{task.source_name} · 第 {task.row_number} 行</small></td><td><span className={'kind kind-' + task.kind}>{task.kind}</span></td>
               <td className="date-cell"><b>{task.treasury || '—'}</b><small>{date(task.start)} — {date(task.end)}</small></td>
               <td><Badge status={task.status}/>{task.status === 'running' && <small className="stage">{task.stage}</small>}</td>
-              <td>{retryable(task) ? <button className="row-button" disabled={locked || !!busy} onClick={() => void command('retry', { ids: [task.id] })}><RefreshCw size={14}/>重试</button> :
+              <td>{retryable(task) ? <button className="row-button" disabled={configureLocked || !!busy} onClick={() => void command('retry', { ids: [task.id] })}><RefreshCw size={14}/>重试</button> :
                 <button className="row-button" onClick={() => void attempt('details', async () => setDetail(await api!.call('details', { id: task.id })))}>详情 <ChevronRight size={14}/></button>}</td></tr>)}
           </tbody></table></div> : <div className="empty-state"><span><FileSpreadsheet size={34}/></span><h3>{tab === 'failed' ? '这里没有需要处理的任务' : state.tasks.length ? '没有符合筛选条件的任务' : '把参数表放进来，其余交给工作台'}</h3>
             <p>{tab === 'failed' ? '失败、超时和中断任务会集中显示在这里，可逐条或批量重试。' : '支持收入、支出、库存自由查询 · 多文件导入 · 运行中追加'}</p>
-            {tab === 'queue' && !state.tasks.length && <button className="btn" disabled={locked} onClick={() => setModal('import')}><Plus size={16}/>添加第一份参数表</button>}</div>}
+            {tab === 'queue' && !state.tasks.length && <button className="btn" disabled={configureLocked} onClick={() => setModal('import')}><Plus size={16}/>添加第一份参数表</button>}</div>}
           <footer className="table-footer"><span>共 {filtered.length} 条 · 参数与输出路径按导入时锁定</span><div><button className="icon-button" aria-label="上一页" disabled={page === 0} onClick={() => setPage(p => p - 1)}><ChevronLeft size={16}/></button>
             <span>{Math.min(page, pages - 1) + 1} / {pages}</span><button className="icon-button" aria-label="下一页" disabled={page >= pages - 1} onClick={() => setPage(p => p + 1)}><ChevronRight size={16}/></button></div></footer>
         </section>}
@@ -246,13 +268,17 @@ function App() {
       <div className="modal-header"><div><div className="eyebrow">{modal === 'login' ? 'CONNECT' : modal === 'import' ? 'IMPORT & PREVIEW' : 'PREFERENCES'}</div><h2 id="modal-title">{modal === 'login' ? '连接 TMIS' : modal === 'import' ? '添加参数表' : '偏好与浏览器'}</h2></div>
         <button className="icon-button" disabled={!!busy} aria-label="关闭对话框" onClick={() => { setModal(null); setUrl(''); }}><X size={20}/></button></div>
       {modal === 'login' && <form onSubmit={event => { event.preventDefault(); const loginUrl = url; setUrl(''); setModal(null); void command('login', { url: loginUrl, browser_path: browserPath }); }}>
-        <div className="modal-body"><div className="notice"><ShieldCheck size={18}/><span>登录链接只保留在当前运行内存中，不写入任务库、设置或日志。</span></div>
+        <div className="modal-body"><div className="notice"><ShieldCheck size={18}/><span>重新登录“{workspace.name}”。原有队列和目录保留，不影响其他工作区；登录链接不落盘。</span></div>
           <label>完整登录链接<textarea autoFocus required rows={4} value={url} placeholder="粘贴含登录信息的完整 http:// 或 https:// 链接" onChange={e => setUrl(e.target.value)} autoComplete="off" spellCheck={false}/></label>
           <p className="hint">连接成功后，可以再选择参数表和下载目录。请确保本机可访问 TMIS 内网。</p>
           <div className="setting-row"><div><b>登录时使用{state.headless ? '无头' : '有头'}浏览器</b><small>在“偏好与浏览器”中更改模式</small></div><Monitor size={21}/></div></div>
         <div className="modal-footer"><button type="button" className="btn" onClick={() => { setUrl(''); setModal(null); }}>取消</button><button className="btn primary" disabled={!url.trim() || !!busy || locked}><Link size={16}/>连接工作界面</button></div>
       </form>}
       {modal === 'settings' && <><div className="modal-body">
+        <div className="notice"><Monitor size={18}/>以下浏览器操作仅作用于“{workspace.name}”。</div>
+        <label>工作区名称<input defaultValue={workspace.name} maxLength={40} onBlur={e => { if (e.target.value !== workspace.name) void attempt('rename', () => api!.workspaces('update', { id: workspace.id, settings: { name: e.target.value } })); }}/></label>
+        <label>默认保存根目录<button className="directory-choice" aria-label="设置工作区默认目录" onClick={() => void attempt('root', async () => { const p = await api?.directory(); if (p) { await api!.workspaces('update', { id: workspace.id, settings: { root: p } }); setRoot(p); } })}><FolderOpen size={16}/><span>{workspace.root || '尚未选择'}</span></button></label>
+        <p className="hint">修改只影响后续导入。已加入任务继续使用原保存路径。</p>
         <div className="setting-row"><div><b>后台无头模式</b><small>切换需重建浏览器；运行中会等待当前条结束。</small></div>
           <button role="switch" aria-checked={state.pending_headless ?? state.headless} aria-label="后台无头模式" className={'switch ' + ((state.pending_headless ?? state.headless) ? 'on' : '')}
             disabled={locked || state.switching || state.mode === 'logging_in' || !!busy} onClick={() => void command('request_mode', { headless: !(state.pending_headless ?? state.headless) })}><i/></button></div>
@@ -261,17 +287,18 @@ function App() {
         <div className="setting-row"><div><b>浏览器窗口</b><small>最小化不会切换为无头，也不会重启会话。</small></div></div>
         <div className="button-row"><button className="btn" disabled={locked || !state.session_ready || state.headless || state.switching} onClick={() => void command('browser_window', { action: 'minimize' })}><Minus size={16}/>最小化浏览器</button>
           <button className="btn" disabled={locked || !state.session_ready || state.headless || state.switching} onClick={() => void command('browser_window', { action: 'restore' })}><Monitor size={16}/>还原浏览器</button></div>
-        <label className="browser-path">浏览器可执行文件（可选）<div className="input-with-button"><input value={browserPath} onChange={e => setBrowserPath(e.target.value)} placeholder="默认使用随包浏览器 / 系统 Chrome"/>
-          <button className="btn" onClick={() => void attempt('browser', async () => { const p = await api?.browser(); if (p) setBrowserPath(p); })}>选择</button></div></label>
+        <label className="browser-path">浏览器可执行文件（可选）<div className="input-with-button"><input value={browserPath} onChange={e => setBrowserPath(e.target.value)} onBlur={() => void attempt('browser', () => api!.workspaces('update', { id: workspace.id, settings: { browserPath } }))} placeholder="默认使用随包浏览器 / 系统 Chrome"/>
+          <button className="btn" onClick={() => void attempt('browser', async () => { const p = await api?.browser(); if (p) { setBrowserPath(p); await api!.workspaces('update', { id: workspace.id, settings: { browserPath: p } }); } })}>选择</button></div></label>
         <p className="hint">自定义路径在下次连接时生效。清空后恢复自动选择。</p>
         <div className="setting-row"><div><b>悬浮窗置顶</b><small>可拖动、靠边吸附，记住上次位置。</small></div><button role="switch" aria-checked={top} aria-label="悬浮窗置顶" className={'switch ' + (top ? 'on' : '')} onClick={() => showWindow('top', !top)}><i/></button></div>
         <div className="setting-row"><div><b>本机任务库</b><small className="break">{state.state_dir || '连接后台后显示'}</small></div><button className="icon-button" aria-label="打开任务库目录" disabled={!state.state_dir} onClick={() => void attempt('open', () => api!.open(state.state_dir))}><FolderOpen size={19}/></button></div>
+        <div className="setting-row"><div><b>断开此浏览器</b><small>请先暂停并等待当前任务结束；保留本队列和文件。</small></div><button className="btn" disabled={locked || !!state.current || state.switching || !!busy} onClick={async () => { if (confirm('仅断开“' + workspace.name + '”的浏览器？原队列保留。')) { await command('disconnect'); setModal(null); } }}>断开连接</button></div>
       </div><div className="modal-footer"><button className="btn primary" onClick={() => setModal(null)}>完成</button></div></>}
-      {modal === 'import' && <><div className="modal-body import-body"><div className="import-config">
+      {modal === 'import' && <><div className="import-target"><b>目标工作区：{workspace.name}</b><span>实际保存位置：{root ? root.replace(/[\\/]$/, '') + '/' + workspace.folder + '/参数表批次/' : '请先选择保存根目录'}</span></div><div className="modal-body import-body"><div className="import-config">
         <label>1. 选择参数表<button aria-label="选择 Excel 参数表" className="upload-zone" disabled={!!busy || locked} onClick={() => void chooseFiles()}><FileSpreadsheet size={27}/><b>选择 Excel 参数表</b><span>可多选，也可直接拖入窗口</span></button></label>
         <div className="file-list">{paths.map(p => <div key={p}><FileSpreadsheet size={15}/><span title={p}>{shortName(p)}</span><button className="icon-button" disabled={!!busy} aria-label={'移除 ' + shortName(p)} onClick={() => { void discardPreview(); setPaths(prev => prev.filter(x => x !== p)); }}><X size={14}/></button></div>)}</div>
         <label>2. 下载目录<button aria-label="选择下载目录" className="directory-choice" disabled={!!busy} onClick={() => void attempt('directory', async () => { const p = await api?.directory(); if (p) setRoot(p); })}><FolderOpen size={17}/><span>{root || '选择本机文件夹'}</span><ChevronRight size={15}/></button></label>
-        <p className="hint">每份参数表会创建独立子目录，不覆盖已有文件。</p>
+        <p className="hint">在所选根目录中建立“{workspace.folder} / 参数表批次”子目录。首次导入记为默认根目录，之后可为本批次单独修改。</p>
         <label>文件命名<select value={options.naming_mode} disabled={!!busy} onChange={e => void changeOptions({ ...options, naming_mode: e.target.value })}><option value="param">优先使用参数表“文件名称”</option><option value="auto">自动命名（日期 / 国库 / 报表）</option></select></label>
         <div className="two-col"><label>后备起始日期<input type="date" value={options.start_date} disabled={!!busy} onChange={e => void changeOptions({ ...options, start_date: e.target.value })}/></label>
           <label>后备终止日期<input type="date" value={options.end_date} disabled={!!busy} onChange={e => void changeOptions({ ...options, end_date: e.target.value })}/></label></div>
@@ -284,7 +311,7 @@ function App() {
           <><div className="preview-summary"><b>{previews.reduce((n, p) => n + (p.count || 0), 0)}</b><span>条待导入任务 / {previews.filter(p => p.id).length} 份参数表</span></div>
             {previews.map((p, i) => <article className={'preview-file ' + (p.error ? 'invalid' : '')} key={p.id || i}><b><FileSpreadsheet size={17}/>{p.name}</b>
               {p.error ? <p className="red">{p.error}</p> : <><p>{Object.entries(p.kinds || {}).map(([k, n]) => k + ' ' + n + ' 条').join(' · ')}</p><small>{date(p.start)} — {date(p.end)}</small>
-                {p.duplicate && <div className="amber">检测到相同参数内容，需要确认重复导入。</div>}
+                {p.duplicate && <div className="amber">检测到相同参数内容，需要确认重复导入。{p.duplicate_workspaces?.length ? '其他工作区：' + p.duplicate_workspaces.join('、') : ''}</div>}
                 <details><summary>查看参数样例</summary>{p.sample?.map((sample, n) => <div key={n} className="sample"><b>{sample.output_name}</b><dl>{Object.entries(sample.params).filter(([k]) => ['pTreCode', 'pStartDate', 'pEndDate', 'pSbtCode', 'pBookSbt', 'pGovernFlag', 'pShowScope', 'pBdgLevel'].includes(k)).map(([k, v]) => <React.Fragment key={k}><dt>{({ pTreCode: '国库', pStartDate: '起始日期', pEndDate: '终止日期', pSbtCode: '预算科目', pBookSbt: '会计科目', pGovernFlag: '辖属标志', pShowScope: '展示范围', pBdgLevel: '预算级次' } as Record<string, string>)[k]}</dt><dd>{v}</dd></React.Fragment>)}</dl></div>)}</details></>}
             </article>)}
             {previews.some(p => p.duplicate) && <label className="checkbox-label"><input type="checkbox" checked={duplicate} onChange={e => setDuplicate(e.target.checked)}/>确认重复导入（会生成新的独立批次）</label>}
@@ -306,4 +333,5 @@ function App() {
     {dragging && <div className="drop-overlay"><FileSpreadsheet size={48}/><h2>松开，添加参数表</h2><p>多份 Excel 将一起进入导入检查</p></div>}
   </div>;
 }
-createRoot(document.getElementById('root')!).render(<App/>);
+createRoot(document.getElementById('root')!).render(<WorkspaceHub>{(w, overview, manage, switchTo, workspaces) =>
+  <Workspace key={w.id} workspace={w} overview={overview} manage={manage} switchTo={switchTo} workspaces={workspaces}/>}</WorkspaceHub>);

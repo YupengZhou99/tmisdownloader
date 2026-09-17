@@ -422,6 +422,14 @@ class QueueController:
         self.status()
         self.wake.set()
 
+    async def disconnect(self):
+        if self.current or self.login_job or self.mode_job or self.pending_headless is not None:
+            raise ValueError('请暂停并等待当前任务、登录或模式切换结束后断开连接')
+        self.run_requested = False
+        await self.session.close()
+        self.mode = 'waiting_login'
+        self.status()
+
     async def retry(self, ids=None):
         if ids is None:
             ids = [r['id'] for r in self.store.tasks() if r['status'] in ('failed', 'timed_out')]
