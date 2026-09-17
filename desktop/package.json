@@ -9,6 +9,7 @@
     "dev": "node scripts/build.cjs --serve",
     "build": "tsc --noEmit && node scripts/build.cjs",
     "start": "electron .",
+    "install:runtime": "install-electron",
     "test": "node --test electron/*.test.cjs",
     "smoke": "node scripts/smoke.cjs"
   },
@@ -20,7 +21,7 @@
   "devDependencies": {
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
-    "esbuild": "0.28.0",
+    "esbuild": "0.28.1",
     "electron": "44.4.1",
     "typescript": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz"
   }

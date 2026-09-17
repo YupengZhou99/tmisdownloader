@@ -26,6 +26,8 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 TMIS_BROWSER_TESTS=1 xvfb-run -a python -m unittest discover -s tests -p 'test_report_browser.py' -v
 TMIS_GUI_TESTS=1 xvfb-run -a python -m unittest discover -s tests -p 'test_report_ui.py' -v
 npm --prefix desktop ci --registry=https://registry.npmjs.org --no-audit --no-fund
+node desktop/node_modules/electron/install.js
+test -x desktop/node_modules/electron/dist/electron
 npm --prefix desktop run build
 npm --prefix desktop test
 
@@ -65,5 +67,7 @@ export TMIS_DESKTOP_EXECUTABLE="$PWD/$task_bundle/tmis-workbench"
 # Only the synthetic root-container test uses this; the launcher keeps sandboxing.
 TMIS_CI_ROOT=1 xvfb-run -a node desktop/scripts/smoke.cjs
 cp output/playwright/desktop-smoke.json "$task_bundle/acceptance.json"
+cp DESKTOP_V6.md dist/使用说明.md
+cp output/playwright/desktop-smoke.json dist/验收结果.json
 tar -C dist -czf dist/TMIS-Workbench-V6-Kylin-x64.tar.gz TMIS-Workbench-Kylin-x64
 sha256sum dist/TMIS-Workbench-V6-Kylin-x64.tar.gz | sed 's@  dist/@  @' > dist/TMIS-Workbench-V6-Kylin-x64.tar.gz.sha256

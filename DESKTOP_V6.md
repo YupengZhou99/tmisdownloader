@@ -62,6 +62,7 @@ cd TMIS-Workbench-Kylin-x64
 ```bash
 cd desktop
 npm ci
+npm run install:runtime
 npm run build
 npm start
 ```

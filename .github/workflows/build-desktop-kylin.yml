@@ -39,8 +39,8 @@ jobs:
           path: |
             dist/TMIS-Workbench-V6-Kylin-x64.tar.gz
             dist/TMIS-Workbench-V6-Kylin-x64.tar.gz.sha256
-            DESKTOP_V6.md
-            output/playwright/desktop-smoke.json
+            dist/使用说明.md
+            dist/验收结果.json
           if-no-files-found: error
           retention-days: 30
       - name: Upload desktop test screenshots
