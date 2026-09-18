@@ -4,7 +4,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 cp scripts/debian-bullseye-snapshot.list /etc/apt/sources.list
 apt-get -o Acquire::Retries=3 update
-apt-get install -y --no-install-recommends \
+apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=20 install -y --no-install-recommends \
   tk tcl libtk8.6 libtcl8.6 fonts-noto-cjk curl xz-utils \
   libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
   libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 \
