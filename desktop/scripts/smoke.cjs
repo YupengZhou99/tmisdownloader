@@ -48,7 +48,7 @@ async function run() {
   const pageErrors = [];
   main.on('pageerror', error => pageErrors.push(error.message));
   await main.getByRole('heading', { name: '每一路，各司其职。', exact: true }).waitFor();
-  await waitForState(main, state => state.version === '6.1.0');
+  await waitForState(main, state => state.version === '6.2.0');
   await main.screenshot({ path: path.join(artifacts, 'workbench-empty.png') });
   // Native picker is stubbed in the isolated test process; subsequent user UI,
   // IPC validation, Python parsing, snapshots and downloads are real.
@@ -59,13 +59,13 @@ async function run() {
     });
   }, config);
   if (process.env.TMIS_TEST_BROWSER_PATH) await main.evaluate(browserPath => window.tmis.workspaces('update', { id: 'default', settings: { browserPath } }), process.env.TMIS_TEST_BROWSER_PATH);
-  await main.getByRole('button', { name: '批量登录与确认', exact: true }).click();
+  await main.getByRole('button', { name: '管理登录', exact: true }).click();
   await main.getByRole('textbox', { name: '登录链接 默认工作区', exact: true }).fill(config.url);
   await main.getByRole('button', { name: '全部登录', exact: true }).click();
   await waitForState(main, s => s.session_ready);
   process.stdout.write('PASS independent login\n');
   assert.equal((await main.evaluate(() => window.tmis.call('snapshot', {}, 'default'))).tasks.length, 0, 'login works before file selection');
-  await main.getByRole('button', { name: '确认并配置任务', exact: true }).click();
+  await main.getByRole('button', { name: '进入已登录工作区', exact: true }).click();
   await main.getByRole('button', { name: '进入队列 默认工作区', exact: true }).click();
   async function importFile(files = ['库存.xlsx']) {
     await application.evaluate(({ dialog }, { directory, files }) => {
@@ -132,17 +132,37 @@ async function run() {
   await main.getByRole('button', { name: '下载队列', exact: true }).click();
   await main.getByRole('heading', { name: '下载队列', exact: true }).waitFor();
   await main.screenshot({ path: path.join(artifacts, 'workbench-completed.png'), animations: 'disabled' });
+  const workersBefore = await main.evaluate(() => window.tmis.workspaces('snapshot').then(s => s.workspaces.map(w => w.worker_pid)));
+  await application.evaluate(({ BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows().find(w => !w.webContents.getURL().includes('view=compact'));
+    win.webContents.forcefullyCrashRenderer();
+  });
+  // The old Playwright Page stays marked crashed. Observe the replacement
+  // renderer through Electron rather than reusing that dead test handle.
+  let afterCrash;
+  for (let i = 0; i < 100 && !afterCrash; i++) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+    afterCrash = await application.evaluate(async ({ BrowserWindow }) => {
+      const win = BrowserWindow.getAllWindows().find(w => !w.webContents.getURL().includes('view=compact'));
+      if (win.webContents.isCrashed() || win.webContents.isLoading()) return null;
+      return win.webContents.executeJavaScript("document.body.innerText.includes('每一路，各司其职。') && window.tmis.workspaces('snapshot')").catch(() => null);
+    });
+  }
+  assert.ok(afterCrash, 'replacement renderer responds within twenty seconds');
+  assert.deepEqual(afterCrash.workspaces.map(w => w.worker_pid), workersBefore);
+  assert.equal(afterCrash.workspaces[0].state.counts.succeeded, 6);
+  assert.equal(afterCrash.workspaces[0].state.session_ready, true);
+  process.stdout.write('PASS renderer crash recovery without restarting the queue worker or browser\n');
   assert.deepEqual(pageErrors, []);
   const report = { status: 'ok', platform: process.platform, arch: process.arch,
     electron: await application.evaluate(() => process.versions.electron), downloads: 6,
     login_before_parameters: true, floating_during_execution: true, mode_switch_boundary: true,
     persistent_session: true, successful_retry_skipped: true, multi_file_append: true,
-    failed_row_retry: true, packaged: !!packaged, temporary };
+    failed_row_retry: true, renderer_crash_recovery: true, packaged: !!packaged, temporary };
   fs.writeFileSync(path.join(artifacts, 'desktop-smoke.json'), JSON.stringify(report, null, 2));
   process.stdout.write(JSON.stringify(report) + '\n');
-  await main.evaluate(() => window.tmis.call('pause', {}, 'default'));
   await application.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2 }); });
-  await main.getByRole('button', { name: '退出应用', exact: true }).click();
+  await application.evaluate(({ app }) => app.quit());
   await new Promise((resolve, reject) => {
     if (application.process().exitCode !== null) return resolve();
     const timer = setTimeout(() => reject(new Error('app did not shut down')), 30000);

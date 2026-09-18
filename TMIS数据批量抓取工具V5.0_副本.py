@@ -42,7 +42,7 @@ from tmis_ui import QueueWindow
 from tmis_runtime import (
     browser_environment, browser_launch_options, bundled_browser_path,
     normalize_query_date, normalize_task_row, option_matches,
-    redact_urls, publish_download,
+    redact_urls, publish_download, FormInteractionError,
 )
 
 # URL 狙击手所需
@@ -510,29 +510,41 @@ class ReportEngine:
         form_item = page.locator(f'.el-form-item:visible:has(label[for="{field_id}"])').first
         dropdown_input = form_item.locator('.el-select .el-input__inner').first
         await dropdown_input.wait_for(state="visible", timeout=10000)
-        await dropdown_input.click()
-        await asyncio.sleep(0.5)
-
-        # 遍历所有可见的下拉选项
-        found = False
-        visible_items = page.locator(".el-select-dropdown__item:visible")
-        count = await visible_items.count()
-
-        for i in range(count):
-            item = visible_items.nth(i)
-            item_text = (await item.text_content() or "").strip()
-
-            # 匹配：精确匹配 / 前缀匹配（如 "0" 匹配 "0 -- 全辖"）
-            if option_matches(value, item_text):
-                await item.click()
-                found = True
-                break
-
-        if not found:
+        # Avoid opening the popup when the selected value is already correct.
+        if option_matches(value, await dropdown_input.input_value()):
+            return
+        try:
+            await page.keyboard.press("Escape")
+            await dropdown_input.click(timeout=10000)
+            # A fixed 500 ms sleep used to confuse a delayed/hidden popup with
+            # an invalid parameter. Wait for a single, populated live popup.
+            popup = page.locator('.el-select-dropdown:visible')
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if await popup.count() == 1 and await popup.locator('.el-select-dropdown__item:visible').count():
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise FormInteractionError(f'下拉字段 {field_id} 未正常展开或渲染；请还原浏览器或使用无头模式，参数未判为无效')
+            visible_items = popup.locator('.el-select-dropdown__item:visible')
+            labels = await visible_items.all_text_contents()
+            for i, label in enumerate(labels):
+                if option_matches(value, label):
+                    await visible_items.nth(i).click(timeout=10000)
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        if option_matches(value, await dropdown_input.input_value()):
+                            return
+                        await asyncio.sleep(0.1)
+                    raise FormInteractionError(f'下拉字段 {field_id} 点击后未选中目标值；已停止本条查询')
             await page.keyboard.press("Escape")
             raise ValueError(f"下拉字段 {field_id} 中不存在选项 {value}，本条不执行查询")
-
-        await asyncio.sleep(0.3)
+        except ValueError:
+            raise
+        except FormInteractionError:
+            raise
+        except Exception as error:
+            raise FormInteractionError(f'下拉字段 {field_id} 操作未完成；请检查窗口状态，参数未判为无效') from error
 
     async def _set_checkbox(self, page: Page, label_text: str, target: int):
         """设置复选框状态（通过 is-checked 类判断）"""
@@ -604,6 +616,7 @@ class ReportEngine:
         dynamic_name: str,
         sz_type: str = "收入",
         keep_original_name: bool = True,
+        on_saved=None,
     ) -> str:
         """
         切入 iframe，使用 force=True 点击"原样导出"，保存文件。
@@ -646,11 +659,19 @@ class ReportEngine:
             # never overwrite an earlier report, even when a retry races a file.
             try:
                 publish_download(temp_path, save_path)
+                if on_saved is not None:
+                    on_saved(save_path)
             except FileExistsError as error:
                 raise FileExistsError("输出文件已存在，未覆盖；请先核对或移走已有文件再重试：" + new_filename) from error
         finally:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
+            # save_as creates a separate copy. Release Playwright's internal
+            # temporary download now, not at the end of a multi-hour session.
+            try:
+                await asyncio.wait_for(download.delete(), timeout=10)
+            except Exception:
+                self.log('浏览器下载临时副本暂未释放，将在浏览器回收时清理；已保存报表不受影响', 'WARN')
         self.log(f"  文件已保存: {new_filename}", "SUCCESS")
 
         return save_path

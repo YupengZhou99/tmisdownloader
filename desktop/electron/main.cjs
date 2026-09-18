@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 const { WorkerBridge, redact } = require('./bridge.cjs');
 const { WorkspaceManager } = require('./workspaces.cjs');
+const { prepareRuntime, cleanupRuntime, diagnosticLog, systemResources, pressureCapacity, BoundedPublisher } = require('./stability.cjs');
+let runtimeDirectory, startupError;
 
 if (process.env.TMIS_DESKTOP_DATA_DIR) {
   fs.mkdirSync(process.env.TMIS_DESKTOP_DATA_DIR, { recursive: true });
@@ -16,9 +18,17 @@ const pageURL = pathToFileURL(path.join(__dirname, '../dist/index.html')).href;
 const devURL = !app.isPackaged && process.env.TMIS_DEV_URL === 'http://127.0.0.1:5173' ? process.env.TMIS_DEV_URL : null;
 const allowedFiles = new Set(), allowedRoots = new Set();
 let mainWindow, floatWindow, manager, snapshot, quitting = false, asking = false, compact = false;
-let refreshTimer, blocker, prefs = {};
+let refreshTimer, blocker, prefs = {}, resourceTimer, resourceBusy = false, capacity = 4, healthySamples = 0;
+let diagnostic = () => {};
+const publishers = new Map();
+const troubledWindows = new Set();
 const windows = () => [mainWindow, floatWindow].filter(win => win && !win.isDestroyed());
-const broadcast = message => windows().forEach(win => win.webContents.send('tmis:event', message));
+const broadcast = message => windows().forEach(win => publishers.get(win)?.push(message));
+ipcMain.on('tmis:ack', (event, seq) => {
+  if (!Number.isInteger(seq)) return;
+  const win = windows().find(w => w.webContents === event.sender && event.senderFrame === event.sender.mainFrame);
+  if (win) publishers.get(win)?.ack(seq);
+});
 const prefsPath = () => path.join(app.getPath('userData'), 'window-preferences.json');
 function savePrefs() { try { fs.writeFileSync(prefsPath(), JSON.stringify(prefs), { mode: 0o600 }); } catch {} }
 function authorize(event) {
@@ -61,14 +71,32 @@ function makeWindow(floating) {
     title: floating ? 'TMIS · 下载进度' : 'TMIS · 数据工作台',
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true,
       sandbox: true, nodeIntegration: false, webSecurity: true, partition: 'tmis-ui',
-      backgroundThrottling: false, devTools: !app.isPackaged }
+      backgroundThrottling: true, devTools: !app.isPackaged }
   });
+  publishers.set(win, new BoundedPublisher(win, { compact: floating }));
+  win.on('hide', () => publishers.get(win)?.reset());
+  win.on('closed', () => { publishers.get(win)?.reset(); publishers.delete(win); troubledWindows.delete(win); });
+  win.on('show', () => { publishers.get(win)?.reset(); void refresh(); });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', event => event.preventDefault());
   win.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  win.webContents.on('render-process-gone', () => {
-    if (!quitting) { win.reload(); win.show(); }
-  });
+  let recoveries = [], recoveryTimer;
+  const recoverUI = details => {
+    if (quitting || win.isDestroyed()) return;
+    troubledWindows.add(win);
+    diagnostic('renderer-fault', { floating, ...details });
+    recoveries = recoveries.filter(t => Date.now() - t < 60000);
+    if (recoveries.length >= 2) return;
+    recoveries.push(Date.now());
+    publishers.get(win)?.reset();
+    clearTimeout(recoveryTimer);
+    recoveryTimer = setTimeout(() => { if (!quitting && !win.isDestroyed()) win.reload(); }, 2000);
+  };
+  win.webContents.on('render-process-gone', (_event, details) => recoverUI(details));
+  win.on('unresponsive', () => recoverUI({ reason: 'unresponsive' }));
+  win.on('responsive', () => { troubledWindows.delete(win); clearTimeout(recoveryTimer); });
+  win.on('closed', () => clearTimeout(recoveryTimer));
+  win.webContents.on('did-finish-load', () => { troubledWindows.delete(win); publishers.get(win)?.reset(); void refresh(); });
   win.on('close', event => {
     if (quitting) return;
     event.preventDefault();
@@ -112,13 +140,14 @@ async function confirmExit() {
 async function shutdown() {
   if (quitting) return;
   quitting = true;
+  clearInterval(resourceTimer);
   broadcast({ event: 'closing' });
   if (manager) await manager.shutdown();
   if (blocker !== undefined) powerSaveBlocker.stop(blocker);
   app.quit();
 }
 const commands = new Set(['snapshot', 'preview', 'import_preview', 'discard_preview', 'details',
-  'login', 'start', 'pause', 'disconnect', 'retry', 'remove', 'request_mode', 'cancel_mode', 'browser_window']);
+  'tasks', 'clear_completed', 'login', 'start', 'pause', 'disconnect', 'retry', 'remove', 'request_mode', 'cancel_mode', 'browser_window']);
 const grantKey = (id, value) => id + '\0' + value;
 function rootAllowed(id, root) { return typeof root === 'string' && path.isAbsolute(root) && (allowedRoots.has(grantKey(id, root)) || manager.get(id).meta.root === root); }
 ipcMain.handle('tmis:call', async (event, command, data = {}, workspaceId) => {
@@ -129,7 +158,7 @@ ipcMain.handle('tmis:call', async (event, command, data = {}, workspaceId) => {
     throw new Error('请通过文件选择或拖放导入参数表');
   if (command === 'import_preview' && !rootAllowed(workspaceId, data.root)) throw new Error('请先为此工作区选择下载目录');
   const result = await manager.call(workspaceId, command, data);
-  scheduleRefresh();
+  if (!['tasks', 'details'].includes(command)) scheduleRefresh();
   return result;
 });
 ipcMain.handle('tmis:workspaces', async (event, action, data = {}) => {
@@ -149,7 +178,7 @@ ipcMain.handle('tmis:workspaces', async (event, action, data = {}) => {
     if (!Array.isArray(data.entries) || data.entries.length < 1 || data.entries.length > 4 || new Set(data.entries.map(e => e.id)).size !== data.entries.length) throw new Error('请选择 1～4 个不同工作区登录');
     data.entries.forEach(e => manager.get(e.id));
     result = await Promise.all(data.entries.map(async e => {
-      try { await manager.login(e.id, { url: e.url }); return { id: e.id, ok: true }; }
+      try { await manager.login(e.id, { url: e.url, headless: e.headless }); return { id: e.id, ok: true }; }
       catch (error) { return { id: e.id, ok: false, error: redact(error.message) }; }
     }));
   } else throw new Error('未知工作区操作');
@@ -207,10 +236,19 @@ ipcMain.handle('tmis:open', async (event, target, id) => {
 });
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on('second-instance', () => { if (mainWindow) setCompact(false); });
+  try { runtimeDirectory = prepareRuntime(app); } catch (error) { startupError = error; }
+  app.on('will-quit', () => cleanupRuntime(runtimeDirectory));
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (troubledWindows.has(mainWindow) || mainWindow.webContents.isCrashed()) {
+      publishers.get(mainWindow)?.reset(); mainWindow.reload();
+    }
+    setCompact(false);
+  });
   app.on('activate', () => { if (mainWindow) setCompact(false); });
   app.on('before-quit', event => { if (!quitting && mainWindow) { event.preventDefault(); void confirmExit(); } });
   app.whenReady().then(() => {
+    if (startupError) throw startupError;
     nativeTheme.themeSource = 'light';
     Menu.setApplicationMenu(process.platform === 'darwin' ? Menu.buildFromTemplate([
       { label: 'TMIS', submenu: [{ role: 'about' }, { type: 'separator' },
@@ -230,6 +268,35 @@ else {
         env: { ...process.env, TMIS_STATE_DIR: stateDir, TMIS_BACKUP_LEGACY: legacy ? '1' : '0', PYTHONUTF8: '1', PYTHONUNBUFFERED: '1' },
         stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
     } });
+    diagnostic = diagnosticLog(path.join(manager.directory, 'diagnostics'));
+    app.on('child-process-gone', (_event, details) => diagnostic('child-process-gone', details));
+    resourceTimer = setInterval(async () => {
+      if (quitting || resourceBusy || process.platform !== 'linux') return;
+      resourceBusy = true;
+      try {
+        const sample = systemResources(runtimeDirectory || app.getPath('temp'));
+        await Promise.allSettled(manager.active().filter(e => e.online && e.bridge && !e.bridge.closed).map(async e => {
+          e.state.resources = await e.bridge.call('resources', {}, 10000);
+        }));
+        diagnostic('resources', { ...sample, capacity,
+          electron: app.getAppMetrics().map(p => ({ pid: p.pid, type: p.type, memory: p.memory })),
+          workspaces: manager.active().map(e => ({ id: e.meta.id, resources: e.state.resources })) });
+        const proposed = pressureCapacity(sample);
+        if (proposed < capacity) { capacity = proposed; healthySamples = 0; }
+        else if (proposed > capacity && ++healthySamples >= 12) { capacity = Math.min(proposed, capacity + 1); healthySamples = 0; }
+        else if (proposed === capacity) healthySamples = 0;
+        const candidates = manager.active().filter(e => e.online && (e.state.session_ready || e.state.resources?.parked))
+          .sort((a, b) => Number(!!b.state.run_requested) - Number(!!a.state.run_requested));
+        await Promise.allSettled(candidates.map((e, i) => {
+          const hold = i >= capacity;
+          if (!!e.state.resource_hold === hold) return Promise.resolve();
+          return e.bridge.call('resource_gate', { hold, reason: '系统内存、共享内存或临时磁盘空间达到保护阈值' }, 10000);
+        }));
+        broadcast({ event: 'resources', data: { ...sample, capacity } });
+      } catch (error) { diagnostic('monitor-error', { message: error.message }); }
+      finally { resourceBusy = false; }
+    }, 5000);
+    resourceTimer.unref();
     manager.on('event', message => { if (!quitting || message.event !== 'offline') broadcast(message); });
     manager.on('change', scheduleRefresh);
     void manager.initialize().then(scheduleRefresh);

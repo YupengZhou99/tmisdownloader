@@ -10,11 +10,11 @@ import './style.css';
 
 const empty: State = { tasks: [], batches: [], counts: {}, mode: 'idle', current: null,
   session_ready: false, headless: false, pending_headless: null, switching: false,
-  importing: false, state_dir: '', version: '6.1.0' };
+  importing: false, state_dir: '', version: '6.2.0' };
 const statusName: Record<string, string> = { pending: '待执行', running: '执行中', succeeded: '已完成',
   failed: '失败', timed_out: '超时', interrupted: '待恢复', cancelled: '已移除' };
 const modeName: Record<string, string> = { idle: '服务待命', running: '正在执行', paused: '队列已暂停',
-  pausing: '当前条结束后暂停', waiting_login: '等待登录', logging_in: '正在登录', switching: '正在切换浏览器' };
+  pausing: '当前条结束后暂停', waiting_login: '等待登录', logging_in: '正在登录', switching: '正在回收/切换浏览器', resource_paused: '资源保护 · 暂缓运行' };
 const retryable = (task: Task) => ['failed', 'timed_out', 'interrupted'].includes(task.status);
 const date = (value = '') => value.length === 8 ? value.slice(0, 4) + '.' + value.slice(4, 6) + '.' + value.slice(6) : value;
 const shortName = (path: string) => path.split(/[\\/]/).pop() || path;
@@ -40,11 +40,13 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
   const [toast, setToast] = useState(''), [completion, setCompletion] = useState<Record<string, number> | null>(null);
   const [modal, setModal] = useState<'login' | 'import' | 'settings' | null>(null), [busy, setBusy] = useState('');
   const [url, setUrl] = useState(''), [browserPath, setBrowserPath] = useState(workspace.browserPath || ''), [top, setTop] = useState(true);
+  const [loginHeadless, setLoginHeadless] = useState(workspace.headless ?? state.headless);
   const [paths, setPaths] = useState<string[]>([]), [root, setRoot] = useState(workspace.root || ''), [previews, setPreviews] = useState<Preview[]>([]);
   const [duplicate, setDuplicate] = useState(false), [options, setOptions] = useState<Options>({ start_date: '', end_date: '', naming_mode: 'param', postprocess: false });
   const [search, setSearch] = useState(''), [kind, setKind] = useState(''), [batch, setBatch] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set()), [page, setPage] = useState(0);
   const [detail, setDetail] = useState<any>(null), [dragging, setDragging] = useState(false);
+  const [taskPage, setTaskPage] = useState<{ tasks: Task[]; total: number }>({ tasks: [], total: 0 });
   async function attempt<T>(name: string, action: () => Promise<T>): Promise<T | undefined> {
     setBusy(name);
     try { return await action(); }
@@ -69,7 +71,7 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
       if (event.event === 'offline') { setOffline(true); setToast(event.message); }
       if (event.event === 'closing') setClosing(true);
       if (event.event === 'window') setTop(event.top);
-      if (event.event === 'log') setLogs(items => [...items, { text: event.text, level: event.level, time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) }].slice(-300));
+      if (event.event === 'log') setLogs(items => event.log_id && items.some(l => l.log_id === event.log_id) ? items : [...items, { text: event.text, level: event.level, log_id: event.log_id, time: event.time || new Date().toLocaleTimeString('zh-CN', { hour12: false }) }].slice(-300));
       if (event.event === 'completed') {
         setCompletion(event.counts);
         if (event.counts.failed || event.counts.timed_out) setTab('failed');
@@ -77,6 +79,18 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
     });
   }, []);
   useEffect(() => { setPage(0); setSelected(new Set()); }, [tab, search, kind, batch]);
+  useEffect(() => {
+    if (!api || !['queue', 'failed'].includes(tab)) return;
+    let disposed = false;
+    const timer = setTimeout(() => { void api.call<{ tasks: Task[]; total: number }>('tasks', {
+      offset: page * 60, limit: 60, search, kind, batch, failed: tab === 'failed'
+    }).then(result => {
+      if (disposed) return;
+      if (page && page * 60 >= result.total) { setPage(Math.max(0, Math.ceil(result.total / 60) - 1)); return; }
+      setTaskPage(result);
+    }).catch(error => { if (!disposed) setToast(errorText(error)); }); }, 150);
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [api, tab, search, kind, batch, page, state.tasks]);
   useEffect(() => {
     setOffline(!workspace.online);
     setState(workspace.state);
@@ -102,20 +116,17 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
   }, [api, busy, detail]);
   const count = (name: string) => state.counts[name] || 0;
   const failures = count('failed') + count('timed_out') + count('interrupted');
-  const total = state.tasks.length - count('cancelled');
+  const total = Object.values(state.counts).reduce((a, b) => a + b, 0) - count('cancelled');
   const finished = count('succeeded') + count('failed') + count('timed_out');
   const progress = total ? Math.round(finished / total * 100) : 0;
-  const current = state.tasks.find(t => t.id === state.current);
-  const running = ['running', 'pausing'].includes(state.mode);
+  const current = state.current_task || state.tasks.find(t => t.id === state.current);
+  const running = ['running', 'pausing'].includes(state.mode) || (['resource_paused', 'switching'].includes(state.mode) && state.run_requested === true);
   const locked = offline || closing;
   const configureLocked = locked || !workspace.confirmed;
-  const filtered = useMemo(() => state.tasks.filter(task =>
-    (tab !== 'failed' || retryable(task)) && (!kind || task.kind === kind) && (!batch || task.batch_id === batch) &&
-    (!search || [task.output_name, task.source_name, task.treasury, task.start, statusName[task.status]].join(' ').toLowerCase().includes(search.toLowerCase()))
-  ), [state.tasks, tab, kind, batch, search]);
-  const pages = Math.max(1, Math.ceil(filtered.length / 60));
-  const visible = filtered.slice(Math.min(page, pages - 1) * 60, (Math.min(page, pages - 1) + 1) * 60);
-  const selection = state.tasks.filter(t => selected.has(t.id));
+  const filtered = taskPage.tasks;
+  const pages = Math.max(1, Math.ceil(taskPage.total / 60));
+  const visible = filtered;
+  const selection = visible.filter(t => selected.has(t.id));
   function toggle(id: string) { setSelected(prev => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next; }); }
   async function changeOptions(next: Options) {
     await discardPreview();
@@ -175,7 +186,7 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
     onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragging(false); }}
     onDrop={event => { event.preventDefault(); setDragging(false); if (!configureLocked && !busy) void chooseFiles(Array.from(event.dataTransfer.files)); }}>
     <aside className="sidebar">
-      <div className="brand"><span className="logo"><ArrowDownToLine size={24}/></span><div><b>TMIS</b><span>数据工作台</span></div><span className="version">6.1</span></div>
+      <div className="brand"><span className="logo"><ArrowDownToLine size={24}/></span><div><b>TMIS</b><span>数据工作台</span></div><span className="version">6.2</span></div>
       <button className="nav" onClick={overview}><ArrowLeft size={18}/>所有工作区</button>
       <div className="workspace-selector"><label>当前独立队列<select aria-label="切换工作区" value={workspace.id} onChange={e => switchTo(e.target.value)}>{workspaces.map(w => <option value={w.id} key={w.id}>{w.name}</option>)}</select></label></div>
       <div className="sidebar-caption">{workspace.name}</div>
@@ -198,7 +209,8 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
         <div className="page-heading"><div><div className="eyebrow">{workspace.name} / INDEPENDENT QUEUE</div><h1>{({ queue: '下载队列', failed: '待处理任务', batches: '参数表批次', logs: '运行日志' } as Record<string, string>)[tab]}</h1>
           <p>让报表下载，有条不紊。{tab === 'queue' ? ' 收入、支出、库存，自由查询一站管理。' : ' 每一次执行都有记录，每一个任务都可追溯。'}</p></div>
           <button className="btn primary" disabled={configureLocked || !!busy} onClick={() => setModal('import')}><Plus size={17}/>添加参数表</button></div>
-        {!workspace.confirmed && <div className="notice warning"><Link size={18}/><span>此工作区尚未完成本轮登录确认，已有队列仅供查看。</span><button className="text-button" onClick={manage}>登录并确认全部会话</button></div>}
+        {!workspace.confirmed && <div className="notice warning"><Link size={18}/><span>登录此工作区即可继续原队列，无需登录其他工作区。</span><button className="text-button" onClick={() => setModal('login')}>登录此工作区</button></div>}
+        {state.resource_hold && <div className="notice warning"><CircleAlert size={18}/><span>资源保护已启用：当前条结束后释放浏览器，待资源恢复再继续。你仍可点击暂停，阻止自动继续。</span></div>}
         {offline && <div className="notice danger"><CircleAlert size={18}/>{api ? '此工作区后台尚未连接或已停止。请重新登录恢复本队列；其他工作区不受影响，已保存的任务不会丢失。' : '当前为浏览器外观预览，下载、文件选择和窗口控制仅在桌面应用中可用。'}</div>}
         {closing && <div className="notice"><LoaderCircle className="spin" size={18}/>正在保存任务并关闭浏览器，请稍候…</div>}
         {completion && <div className={'notice ' + (completion.failed || completion.timed_out ? 'warning' : 'success')}><CheckCircle2 size={18}/>
@@ -215,7 +227,7 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
           <div className="control-main"><div className={'session-icon ' + (state.session_ready ? 'connected' : '')}><Monitor size={23}/></div>
             <div className="session-text"><b>{state.session_ready ? 'TMIS 会话已就绪' : state.mode === 'logging_in' ? '正在连接 TMIS…' : '先登录，随时开始'}</b>
               <span>{state.session_ready ? (state.headless ? '无头模式 · 浏览器在后台执行' : '有头模式 · 可查看浏览器页面') : '粘贴登录链接即可连接，无需先选择参数表。'}</span></div>
-            <button className="btn" disabled={!!state.current || state.switching || state.pending_headless !== null || state.mode === 'logging_in'} onClick={() => workspace.confirmed ? setModal('login') : manage()}><Link size={15}/>{state.session_ready ? '重新登录' : '连接 TMIS'}</button>
+            <button className="btn" disabled={!!state.current || state.switching || state.pending_headless !== null || state.mode === 'logging_in'} onClick={() => setModal('login')}><Link size={15}/>{state.session_ready ? '重新登录' : '连接 TMIS'}</button>
             <button className="icon-button" aria-label="浏览器设置" onClick={() => setModal('settings')}><MoreHorizontal size={20}/></button>
             <span className="vertical-line"/>{startPause}</div>
           <div className="execution-line"><span className={'live-dot ' + (running ? 'active' : '')}/><b>{modeName[state.mode]}</b>
@@ -229,7 +241,10 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
           <div className="panel-toolbar"><div className="search"><Search size={16}/><input aria-label="搜索任务" placeholder="搜索文件名称、国库代码或日期…" value={search} onChange={e => setSearch(e.target.value)}/></div>
             <select aria-label="报表类型" value={kind} onChange={e => setKind(e.target.value)}><option value="">全部报表</option>{['收入', '支出', '库存', '退库'].map(v => <option key={v}>{v}</option>)}</select>
             <select aria-label="参数批次" className="batch-filter" value={batch} onChange={e => setBatch(e.target.value)}><option value="">全部批次</option>{state.batches.map((b, i) => <option key={b.id} value={b.id}>{i + 1}. {b.source_name}</option>)}</select>
-            <span className="grow"/>{tab === 'failed' && <button className="btn" disabled={configureLocked || !!busy || !failures} onClick={() => void command('retry', { ids: state.tasks.filter(retryable).map(t => t.id) })}><RefreshCw size={15}/>重试本队列全部失败 / 中断</button>}
+            <span className="grow"/><button className="btn" disabled={locked || !!busy || !count('succeeded')} onClick={() => {
+              if (confirm('清空此队列中已成功完成的显示记录？不会删除报表、审计历史或未完成任务。')) { setSelected(new Set()); void command('clear_completed'); }
+            }}><Trash2 size={15}/>清空已完成</button>
+            {tab === 'failed' && <button className="btn" disabled={configureLocked || !!busy || !failures} onClick={() => void command('retry')}><RefreshCw size={15}/>重试本队列全部失败 / 中断</button>}
           </div>
           {selected.size > 0 && <div className="selection-bar"><b>已选 {selected.size} 条</b>
             <button className="text-button" disabled={configureLocked || !!busy || !selection.some(retryable)} onClick={() => void command('retry', { ids: selection.filter(retryable).map(t => t.id) })}>重试所选失败 / 中断</button>
@@ -249,12 +264,12 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
           </tbody></table></div> : <div className="empty-state"><span><FileSpreadsheet size={34}/></span><h3>{tab === 'failed' ? '这里没有需要处理的任务' : state.tasks.length ? '没有符合筛选条件的任务' : '把参数表放进来，其余交给工作台'}</h3>
             <p>{tab === 'failed' ? '失败、超时和中断任务会集中显示在这里，可逐条或批量重试。' : '支持收入、支出、库存自由查询 · 多文件导入 · 运行中追加'}</p>
             {tab === 'queue' && !state.tasks.length && <button className="btn" disabled={configureLocked} onClick={() => setModal('import')}><Plus size={16}/>添加第一份参数表</button>}</div>}
-          <footer className="table-footer"><span>共 {filtered.length} 条 · 参数与输出路径按导入时锁定</span><div><button className="icon-button" aria-label="上一页" disabled={page === 0} onClick={() => setPage(p => p - 1)}><ChevronLeft size={16}/></button>
-            <span>{Math.min(page, pages - 1) + 1} / {pages}</span><button className="icon-button" aria-label="下一页" disabled={page >= pages - 1} onClick={() => setPage(p => p + 1)}><ChevronRight size={16}/></button></div></footer>
+          <footer className="table-footer"><span>共 {taskPage.total} 条 · 参数与输出路径按导入时锁定</span><div><button className="icon-button" aria-label="上一页" disabled={page === 0} onClick={() => { setSelected(new Set()); setPage(p => p - 1); }}><ChevronLeft size={16}/></button>
+            <span>{Math.min(page, pages - 1) + 1} / {pages}</span><button className="icon-button" aria-label="下一页" disabled={page >= pages - 1} onClick={() => { setSelected(new Set()); setPage(p => p + 1); }}><ChevronRight size={16}/></button></div></footer>
         </section>}
         {tab === 'batches' && <section className="panel batch-panel"><div className="panel-title"><h3>已导入的参数表</h3><span>{state.batches.length} 个独立批次</span></div>
           {state.batches.map(b => { const tasks = state.tasks.filter(t => t.batch_id === b.id); return <article className="batch-card" key={b.id}><span className="file-icon"><FileSpreadsheet size={24}/></span>
-            <div className="grow"><b>{b.source_name}</b><small>{new Date(b.created).toLocaleString('zh-CN')} · {tasks.length} 条任务 · 成功 {tasks.filter(t => t.status === 'succeeded').length} 条</small>
+            <div className="grow"><b>{b.source_name}</b><small>{new Date(b.created).toLocaleString('zh-CN')} · {b.total ?? tasks.length} 条任务 · 成功 {b.succeeded ?? tasks.filter(t => t.status === 'succeeded').length} 条</small>
               <code>{b.output_dir}</code></div><button className="btn" onClick={() => { setTab('queue'); setBatch(b.id); }}>查看任务</button>
             <button className="icon-button" aria-label="打开批次目录" onClick={() => void attempt('open', () => api!.open(b.output_dir))}><FolderOpen size={19}/></button></article>; })}
           {!state.batches.length && <div className="empty-state"><Files size={34}/><h3>尚未导入参数表</h3><p>每份参数表会获得独立输出目录和结果记录。</p></div>}</section>}
@@ -267,11 +282,12 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
     {modal && <div className="modal-shade"><section role="dialog" aria-modal="true" aria-labelledby="modal-title" className={'modal ' + (modal === 'import' ? 'wide' : '')}>
       <div className="modal-header"><div><div className="eyebrow">{modal === 'login' ? 'CONNECT' : modal === 'import' ? 'IMPORT & PREVIEW' : 'PREFERENCES'}</div><h2 id="modal-title">{modal === 'login' ? '连接 TMIS' : modal === 'import' ? '添加参数表' : '偏好与浏览器'}</h2></div>
         <button className="icon-button" disabled={!!busy} aria-label="关闭对话框" onClick={() => { setModal(null); setUrl(''); }}><X size={20}/></button></div>
-      {modal === 'login' && <form onSubmit={event => { event.preventDefault(); const loginUrl = url; setUrl(''); setModal(null); void command('login', { url: loginUrl, browser_path: browserPath }); }}>
+      {modal === 'login' && <form onSubmit={event => { event.preventDefault(); const loginUrl = url; setUrl(''); setModal(null); void command('login', { url: loginUrl, browser_path: browserPath, headless: loginHeadless }); }}>
         <div className="modal-body"><div className="notice"><ShieldCheck size={18}/><span>重新登录“{workspace.name}”。原有队列和目录保留，不影响其他工作区；登录链接不落盘。</span></div>
           <label>完整登录链接<textarea autoFocus required rows={4} value={url} placeholder="粘贴含登录信息的完整 http:// 或 https:// 链接" onChange={e => setUrl(e.target.value)} autoComplete="off" spellCheck={false}/></label>
           <p className="hint">连接成功后，可以再选择参数表和下载目录。请确保本机可访问 TMIS 内网。</p>
-          <div className="setting-row"><div><b>登录时使用{state.headless ? '无头' : '有头'}浏览器</b><small>在“偏好与浏览器”中更改模式</small></div><Monitor size={21}/></div></div>
+          <label>登录与运行模式<select aria-label="登录与运行模式" value={loginHeadless ? 'headless' : 'headed'} onChange={e => setLoginHeadless(e.target.value === 'headless')}>
+            <option value="headed">有头 · 显示浏览器窗口</option><option value="headless">无头 · 后台下载（推荐）</option></select></label></div>
         <div className="modal-footer"><button type="button" className="btn" onClick={() => { setUrl(''); setModal(null); }}>取消</button><button className="btn primary" disabled={!url.trim() || !!busy || locked}><Link size={16}/>连接工作界面</button></div>
       </form>}
       {modal === 'settings' && <><div className="modal-body">
@@ -285,8 +301,9 @@ function Workspace({ workspace, overview, manage, switchTo, workspaces }: { work
         {modeNotice && <div className="notice warning">{state.switching ? '正在切换并校验会话…' : '已预约切换，可在主界面取消。'}</div>}
         <div className="notice"><CircleAlert size={18}/><span>有头 / 无头不是简单隐藏窗口。若登录无法迁移，会暂停并请你粘贴新链接，已下载文件和任务进度保留。</span></div>
         <div className="setting-row"><div><b>浏览器窗口</b><small>最小化不会切换为无头，也不会重启会话。</small></div></div>
-        <div className="button-row"><button className="btn" disabled={locked || !state.session_ready || state.headless || state.switching} onClick={() => void command('browser_window', { action: 'minimize' })}><Minus size={16}/>最小化浏览器</button>
+        <div className="button-row"><button className="btn" disabled={locked || !state.session_ready || state.headless || state.switching} onClick={() => void command('request_mode', { headless: true })}><Minus size={16}/>后台运行（无头）</button>
           <button className="btn" disabled={locked || !state.session_ready || state.headless || state.switching} onClick={() => void command('browser_window', { action: 'restore' })}><Monitor size={16}/>还原浏览器</button></div>
+        <p className="hint">后台下载请使用无头模式。有头窗口手动最小化可能暂停页面绘制，程序会保护性暂停当前队列，不会让后续整批任务失败。</p>
         <label className="browser-path">浏览器可执行文件（可选）<div className="input-with-button"><input value={browserPath} onChange={e => setBrowserPath(e.target.value)} onBlur={() => void attempt('browser', () => api!.workspaces('update', { id: workspace.id, settings: { browserPath } }))} placeholder="默认使用随包浏览器 / 系统 Chrome"/>
           <button className="btn" onClick={() => void attempt('browser', async () => { const p = await api?.browser(); if (p) { setBrowserPath(p); await api!.workspaces('update', { id: workspace.id, settings: { browserPath: p } }); } })}>选择</button></div></label>
         <p className="hint">自定义路径在下次连接时生效。清空后恢复自动选择。</p>

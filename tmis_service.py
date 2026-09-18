@@ -8,6 +8,8 @@ from pathlib import Path
 import queue
 import re
 import threading
+import time
+import psutil
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 from playwright.async_api import async_playwright, TimeoutError as BrowserTimeout
@@ -15,7 +17,7 @@ from playwright.async_api import async_playwright, TimeoutError as BrowserTimeou
 from tmis_queue import DuplicateBatch, parse_parameter_file
 from tmis_runtime import (
     browser_environment, browser_launch_options, bundled_browser_path,
-    redact_urls, validate_login_url,
+    redact_urls, validate_login_url, FormInteractionError,
 )
 
 
@@ -39,6 +41,44 @@ class BrowserSession:
         self.previous_task = None
         self.switching = False
         self.state_callback = lambda: None
+        self.completed_since_launch = 0
+        self.launched_at = time.monotonic()
+        self.parked_state = None
+        self._resource_time = 0
+        self._resources = {}
+        self._owned_driver = None
+
+    async def _start_playwright(self):
+        before = {p.pid for p in psutil.Process().children()}
+        self.pw = await async_playwright().start()
+        created = [p for p in psutil.Process().children() if p.pid not in before]
+        self._owned_driver = created[0] if len(created) == 1 else None
+
+    def resources(self):
+        if time.monotonic() - self._resource_time >= 5:
+            rss, children = 0, 0
+            try:
+                owned = self._owned_driver.children(recursive=True) + [self._owned_driver] if self._owned_driver and self._owned_driver.is_running() else []
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                owned = []
+            for process in owned:
+                try:
+                    rss += process.memory_info().rss
+                    children += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            self._resources = dict(worker_rss=psutil.Process().memory_info().rss, browser_tree_rss=rss, child_processes=children,
+                                   completed_since_launch=self.completed_since_launch, parked=self.parked_state is not None)
+            self._resource_time = time.monotonic()
+        return dict(self._resources, completed_since_launch=self.completed_since_launch,
+                    parked=self.parked_state is not None)
+
+    def needs_recycle(self):
+        return self.ready and self.completed_since_launch > 0 and (self.completed_since_launch >= 10 or
+            time.monotonic() - self.launched_at >= 1200 or self.resources().get('browser_tree_rss', 0) > 1536 * 1024**2)
+
+    def task_finished(self):
+        self.completed_since_launch += 1
 
     def _disconnected(self):
         self.ready = False
@@ -50,13 +90,21 @@ class BrowserSession:
         if response.status == 401 and urlsplit(response.url).netloc == self.origin:
             self.auth_lost = True
 
-    async def login(self, url, browser_path=''):
+    async def login(self, url, browser_path='', headless=None):
         url = validate_login_url(url)  # kept in memory only for this navigation
+        if self.parked_state is not None:
+            await self.close()  # A fresh URL supersedes the suspended credentials.
+        if headless is not None:
+            if type(headless) is not bool:
+                raise ValueError('浏览器模式无效')
+            if headless != self.headless and self.browser:
+                await self.close()
+            self.headless = headless
         self.ready = False
         if self.browser and (not self.browser.is_connected() or browser_path != self.browser_path):
             await self.close()
         if self.pw is None:
-            self.pw = await async_playwright().start()
+            await self._start_playwright()
         if self.browser is None:
             kwargs = browser_launch_options(browser_path, bundled_browser_path())
             kwargs.update(headless=self.headless, env=browser_environment(), args=[
@@ -66,7 +114,8 @@ class BrowserSession:
             self.browser = await self.pw.chromium.launch(**kwargs)
             self.browser.on('disconnected', self._disconnected)
             self.browser_path = browser_path
-            self.context = await self.browser.new_context(ignore_https_errors=True, viewport=None, accept_downloads=True)
+            self.context = await self.browser.new_context(ignore_https_errors=True,
+                viewport={'width': 1440, 'height': 1000} if self.headless else None, accept_downloads=True)
             self.context.on('response', self._response)
         if self.page is None or self.page.is_closed():
             self.page = await self.context.new_page()
@@ -83,6 +132,9 @@ class BrowserSession:
         self.origin = urlsplit(self.page.url).netloc
         self.auth_lost = False
         self.ready = True
+        self.completed_since_launch = 0
+        self.launched_at = time.monotonic()
+        self._resource_time = 0
         self.log('已进入 TMIS 工作界面；可添加参数表或开始/继续队列', 'SUCCESS')
 
     async def check(self):
@@ -108,13 +160,28 @@ class BrowserSession:
         while True:
             await asyncio.sleep(1)
             await self.check()
+            await self.check_window()
+
+    async def check_window(self):
+        if self.headless or not self.ready:
+            return
+        client = await self.context.new_cdp_session(self.page)
+        try:
+            window = await client.send('Browser.getWindowForTarget')
+            if window.get('bounds', {}).get('windowState') == 'minimized':
+                raise FormInteractionError('有头浏览器已最小化，暂停此队列以免误判参数；请还原窗口或切换无头模式后继续')
+        finally:
+            await client.detach()
 
     async def execute(self, task, stage):
         await self.check()
+        await self.check_window()
         operation = asyncio.create_task(self._execute(task, stage))
         watcher = asyncio.create_task(self._watch_auth())
         try:
             done, _ = await asyncio.wait((operation, watcher), return_when=asyncio.FIRST_COMPLETED)
+            if operation in done:
+                return await operation
             if watcher in done:
                 await watcher
             return await operation
@@ -129,10 +196,11 @@ class BrowserSession:
         engine.run_options = dict(task['options'])
         # A failed post-processing attempt already owns a complete download.
         # Retry only that step; do not download again or overwrite another file.
-        if (task.get('previous_stage') == '数据后处理' and task.get('saved_path')
-                and task['options']['postprocess'] and Path(task['saved_path']).is_file()):
-            stage('数据后处理', task['saved_path'])
-            await asyncio.to_thread(engine._process_excel_data, task['saved_path'], row, kind)
+        if (task.get('previous_stage') in ('数据后处理', '下载已保存') and task.get('saved_path')
+                and Path(task['saved_path']).is_file() and Path(task['saved_path']).stat().st_size > 0):
+            if task['options']['postprocess']:
+                stage('数据后处理', task['saved_path'])
+                await asyncio.to_thread(engine._process_excel_data, task['saved_path'], row, kind)
             return task['saved_path']
         previous = self.previous_task
         # A new file must not inherit form selections from the preceding file.
@@ -151,7 +219,8 @@ class BrowserSession:
         await engine._click_query_and_wait(self.page, kind, timeout_seconds=self.query_timeout)
         await self.check()
         stage('下载报表')
-        saved = await engine._export_and_save(self.page, task['output_dir'], task['output_name'], kind, engine._should_keep_original_name(row))
+        saved = await engine._export_and_save(self.page, task['output_dir'], task['output_name'], kind,
+            engine._should_keep_original_name(row), on_saved=lambda path: stage('下载已保存', path))
         stage('下载已保存', saved)
         if task['options']['postprocess']:
             stage('数据后处理', saved)
@@ -185,14 +254,25 @@ class BrowserSession:
         finally:
             await client.detach()
 
-    async def switch_mode(self, headless):
+    async def switch_mode(self, headless, force=False):
         """Only called at a task boundary. Credentials never leave memory."""
-        if headless == self.headless:
+        if headless == self.headless and not force:
+            return
+        if self.parked_state is not None:
+            self.headless = headless
             return
         if not self.browser or not self.ready:
             if self.browser:
                 await self.close()
             self.headless = headless
+            return
+        await self.park()
+        self.headless = headless
+        await self.unpark()
+        self.log('浏览器已回收重建，登录状态检查通过' if force else '浏览器模式已切换，登录状态检查通过', 'SUCCESS')
+
+    async def park(self):
+        if self.parked_state is not None or not self.ready:
             return
         await self.check()
         storage = await self.context.storage_state()
@@ -220,32 +300,45 @@ class BrowserSession:
         self.switching = True
         try:
             await self.close()
-            self.headless = headless
-            self.pw = await async_playwright().start()
+            self.parked_state = (storage, session_storage, work_url, browser_path, current.netloc)
+        finally:
+            self.switching = False
+
+    async def unpark(self):
+        if self.parked_state is None:
+            return
+        storage, session_storage, work_url, browser_path, origin = self.parked_state
+        self.parked_state = None
+        self.switching = True
+        try:
+            await self._start_playwright()
             kwargs = browser_launch_options(browser_path, bundled_browser_path())
-            kwargs.update(headless=headless, env=browser_environment(), args=['--no-first-run', '--disable-popup-blocking'])
+            kwargs.update(headless=self.headless, env=browser_environment(), args=['--no-first-run', '--disable-popup-blocking'])
             self.browser = await self.pw.chromium.launch(**kwargs)
             self.browser_path = browser_path
             self.browser.on('disconnected', self._disconnected)
             self.context = await self.browser.new_context(
-                storage_state=storage, ignore_https_errors=True, viewport=None, accept_downloads=True)
+                storage_state=storage, ignore_https_errors=True,
+                viewport={'width': 1440, 'height': 1000} if self.headless else None, accept_downloads=True)
             self.context.on('response', self._response)
             await self.context.add_init_script('(() => { const all = ' + json.dumps(session_storage) +
                 '; for (const [k,v] of Object.entries(all[location.origin] || {})) sessionStorage.setItem(k,v); })()')
             self.page = await self.context.new_page()
             self.page.on('close', self._disconnected)
             self.auth_lost = False
-            self.origin = current.netloc
+            self.origin = origin
             await self.page.goto(work_url, wait_until='domcontentloaded', timeout=30000)
             await self.page.get_by_text('固定报表', exact=True).first.wait_for(state='visible', timeout=15000)
             self.ready = True
             await self.check()
             self.previous_task = None
-            self.log('浏览器模式已切换，登录状态检查通过', 'SUCCESS')
+            self.completed_since_launch = 0
+            self.launched_at = time.monotonic()
+            self._resource_time = 0
         except Exception as error:
             self.ready = False
             await self.close()
-            raise SessionExpired('浏览器模式切换未能恢复会话，请粘贴新的登录链接；任务已保留') from error
+            raise SessionExpired('浏览器回收/切换后未能恢复会话，请粘贴新的登录链接；任务已保留') from error
         finally:
             storage.clear()
             session_storage.clear()
@@ -253,6 +346,17 @@ class BrowserSession:
 
     async def close(self):
         self.ready = False
+        owned_driver = self._owned_driver
+        # Capture Process identities before graceful close: the driver may exit
+        # first and leave children reparented. psutil guards against PID reuse.
+        remaining = []
+        if owned_driver:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                remaining = owned_driver.children(recursive=True) + [owned_driver]
+        if self.parked_state is not None:
+            self.parked_state[0].clear()
+            self.parked_state[1].clear()
+            self.parked_state = None
         if self.browser is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.browser.close(), timeout=8)
@@ -260,6 +364,21 @@ class BrowserSession:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.pw.stop(), timeout=8)
         self.pw = self.browser = self.context = self.page = None
+        self._owned_driver = None
+        if remaining:
+            # Kill only descendants of the exact driver we created, never a
+            # name-based list of the user's other Chrome/Electron processes.
+            try:
+                for process in remaining:
+                    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                        if process.is_running():
+                            process.terminate()
+                _, alive = await asyncio.to_thread(psutil.wait_procs, remaining, timeout=2)
+                for process in alive:
+                    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                        process.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
         self.engine.current_nav_type = None
 
 
@@ -278,6 +397,7 @@ class QueueController:
         self.inflight = self.login_job = None
         self.pending_headless = None
         self.mode_job = None
+        self.resource_hold = False
         self.import_jobs = set()
         self.round_results = Counter()
         self.import_lock = asyncio.Lock()
@@ -371,14 +491,17 @@ class QueueController:
             self.status()
             self.wake.set()
 
-    async def login(self, url, browser_path=''):
+    async def login(self, url, browser_path='', headless=None):
         if self.current or self.login_job or self.mode_job or self.pending_headless is not None or self.closing:
             raise ValueError('请先等待当前条完成并暂停，再重新登录')
         self.login_job = asyncio.current_task()
         self.mode = 'logging_in'
         self.status()
         try:
-            await self.session.login(url, browser_path)
+            if headless is None:
+                await self.session.login(url, browser_path)
+            else:
+                await self.session.login(url, browser_path, headless=headless)
             self.mode = 'running' if self.run_requested else 'idle'
         except asyncio.CancelledError:
             raise
@@ -396,7 +519,7 @@ class QueueController:
         if self.closing:
             return
         if restore_interrupted:
-            affected = {r['batch_id'] for r in self.store.tasks() if r['status'] == 'interrupted'}
+            affected = {r['batch_id'] for r in self.store.task_refs(('interrupted',))}
             self.store.resume_interrupted()
             for batch in affected:
                 self.export(batch)
@@ -422,6 +545,16 @@ class QueueController:
         self.status()
         self.wake.set()
 
+    async def resource_gate(self, hold, reason=''):
+        if type(hold) is not bool or not isinstance(reason, str) or len(reason) > 200:
+            raise ValueError('资源保护参数无效')
+        if self.resource_hold == hold:
+            return
+        self.resource_hold = hold
+        self.log(('资源保护：将在当前条结束后暂缓此工作区，释放浏览器。' + reason) if hold else '资源恢复：允许此工作区继续调度', 'WARN' if hold else 'INFO')
+        self.status()
+        self.wake.set()
+
     async def disconnect(self):
         if self.current or self.login_job or self.mode_job or self.pending_headless is not None:
             raise ValueError('请暂停并等待当前任务、登录或模式切换结束后断开连接')
@@ -431,9 +564,11 @@ class QueueController:
         self.status()
 
     async def retry(self, ids=None):
+        candidates = self.store.task_refs(('failed', 'timed_out', 'interrupted'))
         if ids is None:
-            ids = [r['id'] for r in self.store.tasks() if r['status'] in ('failed', 'timed_out')]
-        affected = {r['batch_id'] for r in self.store.tasks() if r['id'] in ids}
+            ids = [r['id'] for r in candidates]
+        selected = set(ids)
+        affected = {r['batch_id'] for r in candidates if r['id'] in selected}
         count = self.store.retry(ids)
         for batch in affected:
             self.export(batch)
@@ -443,7 +578,8 @@ class QueueController:
             await self.start(restore_interrupted=False)
 
     async def remove(self, ids):
-        affected = {r['batch_id'] for r in self.store.tasks() if r['id'] in ids}
+        selected = set(ids)
+        affected = {r['batch_id'] for r in self.store.task_refs(('pending', 'interrupted')) if r['id'] in selected}
         count = self.store.cancel_pending(ids)
         for batch in affected:
             self.export(batch)
@@ -471,6 +607,12 @@ class QueueController:
             self.session.ready = False
             self.mode = 'waiting_login'
             self.log(str(error) + '；当前条和后续任务保留，重新登录后继续', 'WARN')
+        except FormInteractionError as error:
+            self.store.finish(task['id'], 'interrupted', str(error))
+            self.run_requested = False
+            self.mode = 'paused'
+            self.session.previous_task = None
+            self.log(str(error) + '；仅暂停此工作区，后续任务未判失败', 'WARN')
         except asyncio.CancelledError:
             self.store.finish(task['id'], 'interrupted', '用户退出程序；任务已保存，重新登录后可恢复')
             raise
@@ -486,6 +628,8 @@ class QueueController:
                 self.mode = 'waiting_login'
                 self.log(f'查询页面未恢复，已暂停后续任务：{recovery_error}；请检查网络并重新登录', 'WARN')
         finally:
+            if hasattr(self.session, 'task_finished'):
+                self.session.task_finished()
             self.export(task['batch_id'])
             self.emit('changed')
 
@@ -496,6 +640,37 @@ class QueueController:
                 self.wake.clear()
                 if self.pending_headless is not None and not self.login_job:
                     await self._apply_mode()
+                    continue
+                if self.resource_hold:
+                    if self.session.ready and not self.login_job:
+                        self.mode = 'resource_paused'
+                        self.mode_job = asyncio.create_task(self.session.park())
+                        try:
+                            await self.mode_job
+                        except Exception as error:
+                            self.session.ready = False
+                            self.log(f'资源回收未完成：{error}；保留队列等待处理', 'WARN')
+                        finally:
+                            self.mode_job = None
+                            self.status()
+                    await self.wake.wait()
+                    continue
+                parked = getattr(self.session, 'parked_state', None) is not None
+                needs_browser = self.store.counts().get('pending', 0) > 0
+                if self.run_requested and needs_browser and not self.login_job and (parked or getattr(self.session, 'needs_recycle', lambda: False)()):
+                    self.mode = 'switching'
+                    self.mode_job = asyncio.create_task(self.session.unpark() if parked else self.session.switch_mode(self.session.headless, force=True))
+                    self.status()
+                    try:
+                        await self.mode_job
+                        self.mode = 'running' if self.run_requested else 'paused'
+                    except Exception as error:
+                        self.mode = 'waiting_login'
+                        self.session.ready = False
+                        self.log(f'浏览器回收后等待重新登录：{error}', 'WARN')
+                    finally:
+                        self.mode_job = None
+                        self.status()
                     continue
                 if self.run_requested and self.session.ready and self.mode == 'running':
                     try:

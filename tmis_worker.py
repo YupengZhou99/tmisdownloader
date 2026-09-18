@@ -34,18 +34,15 @@ class DesktopAPI:
 
     def snapshot(self):
         c = self.controller
-        tasks = []
-        for task in self.store.tasks():
-            row = {k: v for k, v in task.items() if k not in ('params', 'options', 'source')}
-            row.update(treasury=task['params'].get('pTreCode', ''),
-                       start=task['params'].get('pStartDate', ''),
-                       end=task['params'].get('pEndDate', ''))
-            tasks.append(row)
-        return dict(tasks=tasks, batches=self.store.batches(), counts=self.store.counts(),
+        page = self.store.task_page()
+        current = self.store.task_page(task_id=c.current)['tasks'] if c.current else []
+        return dict(tasks=page['tasks'], task_total=page['total'], current_task=current[0] if current else None,
+                    batches=self.store.batches(limit=200), counts=self.store.counts(),
                     mode=c.mode, current=c.current, session_ready=c.session.ready,
                     headless=c.session.headless, pending_headless=c.pending_headless,
                     switching=bool(c.mode_job), importing=bool(c.import_jobs),
-                    state_dir=str(self.store.directory), version='6.1.0')
+                    resources=getattr(c.session, 'resources', lambda: {})(), resource_hold=c.resource_hold, run_requested=c.run_requested,
+                    state_dir=str(self.store.directory), version='6.2.0')
 
     async def preview(self, paths, options):
         if not isinstance(paths, list) or not 1 <= len(paths) <= 30:
@@ -108,7 +105,10 @@ class DesktopAPI:
         c = self.controller
         fields = {
             'snapshot': (), 'preview': ('paths', 'options'), 'import_preview': ('ids', 'root', 'allow_duplicate'),
-            'discard_preview': ('ids',), 'details': ('id',), 'login': ('url', 'browser_path'),
+            'discard_preview': ('ids',), 'details': ('id',), 'login': ('url', 'browser_path', 'headless'),
+            'tasks': ('offset', 'limit', 'search', 'kind', 'batch', 'failed'), 'clear_completed': (),
+            'has_fingerprints': ('fingerprints',), 'fingerprints': (),
+            'resource_gate': ('hold', 'reason'), 'resources': (),
             'start': (), 'pause': (), 'disconnect': (), 'retry': ('ids',), 'remove': ('ids',),
             'request_mode': ('headless',), 'cancel_mode': (), 'browser_window': ('action',), 'shutdown': (),
         }
@@ -121,6 +121,24 @@ class DesktopAPI:
             raise ValueError('任务选择无效')
         if command == 'snapshot':
             return self.snapshot()
+        if command == 'tasks':
+            return self.store.task_page(**data)
+        if command == 'resources':
+            return getattr(c.session, 'resources', lambda: {})()
+        if command == 'clear_completed':
+            count = self.store.clear_completed()
+            c.emit('changed')
+            c.log(f'已清除 {count} 条成功任务的队列显示；报表与历史记录保留')
+            return count
+        if command == 'has_fingerprints':
+            values = data.get('fingerprints', [])
+            if not isinstance(values, list) or len(values) > 30 or any(not isinstance(v, str) or len(v) > 256 for v in values):
+                raise ValueError('参数指纹无效')
+            with self.store.lock:
+                return any(self.store.connection.execute('SELECT 1 FROM batches WHERE fingerprint=?', (v,)).fetchone() for v in values)
+        if command == 'fingerprints':
+            with self.store.lock:
+                return [r[0] for r in self.store.connection.execute('SELECT DISTINCT fingerprint FROM batches')]
         if command == 'preview':
             return await self.preview(**data)
         if command == 'import_preview':
@@ -130,15 +148,20 @@ class DesktopAPI:
                 self.previews.pop(key, None)
             return
         if command == 'details':
-            task = next((t for t in self.store.tasks() if t['id'] == data.get('id')), None)
-            if task is None:
+            if not isinstance(data.get('id'), str) or len(data['id']) > 128:
+                raise ValueError('任务标识无效')
+            tasks = self.store.tasks(task_id=data['id'])
+            if not tasks:
                 raise ValueError('任务不存在')
+            task = tasks[0]
             return dict(task=task, history=self.store.history(task['id']))
         if command == 'login':
             if not isinstance(data.get('url'), str) or len(data['url']) > 16384:
                 raise ValueError('请输入有效的登录链接')
             if not isinstance(data.get('browser_path', ''), str):
                 raise ValueError('浏览器路径无效')
+            if 'headless' in data and type(data['headless']) is not bool:
+                raise ValueError('浏览器模式无效')
         return await getattr(c, command)(**data)
 
 
@@ -184,7 +207,7 @@ async def run():
         except Exception as error:
             send(dict(id=request_id, error=redact_urls(error)))
     consumer = asyncio.create_task(controller.serve())
-    send(dict(event='ready', version='6.1.0'))
+    send(dict(event='ready', version='6.2.0'))
     try:
         while not controller.closing and not consumer.done():
             reading = asyncio.create_task(incoming.get())

@@ -10,6 +10,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+class FormInteractionError(RuntimeError):
+    """The page could not be operated; this is not an invalid task parameter."""
+
+
 def option_matches(value, label):
     """接受完整选项文本或独立代码，避免 0 匹配到 10。"""
     value, label = str(value).strip(), str(label).strip()

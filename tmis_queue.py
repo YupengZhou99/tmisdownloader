@@ -194,11 +194,16 @@ class QueueStore:
                     saved_path TEXT NOT NULL DEFAULT '', updated TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS task_queue ON tasks(status, position);
+                CREATE INDEX IF NOT EXISTS task_batch_position ON tasks(batch_id, position);
+                CREATE INDEX IF NOT EXISTS task_position ON tasks(position);
                 CREATE TABLE IF NOT EXISTS attempts (
                     task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
                     started TEXT NOT NULL, finished TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL, stage TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
                     saved_path TEXT NOT NULL DEFAULT '', PRIMARY KEY(task_id, number)
+                );
+                CREATE TABLE IF NOT EXISTS cleared_tasks (
+                    task_id TEXT PRIMARY KEY REFERENCES tasks(id), cleared TEXT NOT NULL
                 );
                 PRAGMA user_version=1;
             ''')
@@ -228,18 +233,66 @@ class QueueStore:
                                         (uuid4().hex, batch_id, position + offset, row['kind'], row['sheet'], row['row_number'], json.dumps(row['params'], ensure_ascii=False), row['output_name'], 'pending', utc_now()))
         return batch_id
 
-    def tasks(self):
+    def tasks(self, batch_id=None, task_id=None):
+        clauses, values = [], []
+        for field, value in (('batch_id', batch_id), ('id', task_id)):
+            if value is not None:
+                clauses.append('t.' + field + '=?')
+                values.append(value)
         with self.lock:
             result = self.connection.execute('''SELECT t.*, b.source, b.source_name, b.output_dir, b.options
-                FROM tasks t JOIN batches b ON t.batch_id=b.id ORDER BY t.position''').fetchall()
+                FROM tasks t JOIN batches b ON t.batch_id=b.id'''
+                + (' WHERE ' + ' AND '.join(clauses) if clauses else '') + ' ORDER BY t.position', values).fetchall()
             return [self._decode(row) for row in result]
 
-    def batches(self):
+    def task_refs(self, statuses):
+        # Queue controls need IDs, not every historical row's parameter JSON.
+        with self.lock:
+            return [dict(row) for row in self.connection.execute(
+                'SELECT id,batch_id FROM tasks WHERE status IN (' + ','.join('?' for _ in statuses) + ')', statuses)]
+
+    def task_page(self, offset=0, limit=60, search='', kind='', batch='', failed=False, task_id=''):
+        if (type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200
+                or type(failed) is not bool or any(not isinstance(v, str) or len(v) > 500 for v in (search, kind, batch, task_id))):
+            raise ValueError('分页参数无效')
+        clauses, values = ['c.task_id IS NULL'], []
+        for column, value in [('t.kind', kind), ('t.batch_id', batch), ('t.id', task_id)]:
+            if value:
+                clauses.append(column + '=?')
+                values.append(value)
+        if failed:
+            clauses.append("t.status IN ('failed','timed_out','interrupted')")
+        if search:
+            clauses.append('(t.output_name LIKE ? OR b.source_name LIKE ? OR t.params LIKE ?)')
+            values.extend(['%' + search + '%'] * 3)
+        source = ' FROM tasks t JOIN batches b ON t.batch_id=b.id LEFT JOIN cleared_tasks c ON c.task_id=t.id WHERE ' + ' AND '.join(clauses)
+        with self.lock:
+            total = self.connection.execute('SELECT COUNT(*)' + source, values).fetchone()[0]
+            rows = self.connection.execute('SELECT t.*,b.source_name,b.output_dir' + source
+                                           + ' ORDER BY t.position LIMIT ? OFFSET ?', values + [limit, offset]).fetchall()
+        tasks = []
+        for row in rows:
+            item = dict(row)
+            params = json.loads(item.pop('params'))
+            item.update(treasury=params.get('pTreCode', ''), start=params.get('pStartDate', ''), end=params.get('pEndDate', ''))
+            tasks.append(item)
+        return dict(tasks=tasks, total=total)
+
+    def clear_completed(self):
+        # Logical removal is reversible and never touches reports or audit rows.
+        with self.lock, self.connection:
+            return self.connection.execute("""INSERT OR IGNORE INTO cleared_tasks(task_id,cleared)
+                SELECT id,? FROM tasks WHERE status='succeeded'""", (utc_now(),)).rowcount
+
+    def batches(self, limit=None):
         with self.lock:
             return [dict(row) for row in self.connection.execute('''SELECT b.*, COUNT(t.id) AS total,
                 SUM(t.status='succeeded') AS succeeded, SUM(t.status IN ('failed','timed_out')) AS failed,
                 SUM(t.status IN ('pending','interrupted')) AS pending
-                FROM batches b LEFT JOIN tasks t ON b.id=t.batch_id GROUP BY b.id ORDER BY b.created,b.rowid''')]
+                FROM batches b LEFT JOIN tasks t ON b.id=t.batch_id AND NOT EXISTS
+                (SELECT 1 FROM cleared_tasks c WHERE c.task_id=t.id)
+                GROUP BY b.id ORDER BY b.created DESC,b.rowid DESC'''
+                + (' LIMIT ?' if limit else ''), (limit,) if limit else ())]
 
     @staticmethod
     def _decode(row):
@@ -251,7 +304,8 @@ class QueueStore:
 
     def counts(self):
         with self.lock:
-            return {r[0]: r[1] for r in self.connection.execute('SELECT status,COUNT(*) FROM tasks GROUP BY status')}
+            return {r[0]: r[1] for r in self.connection.execute('''SELECT status,COUNT(*) FROM tasks t
+                WHERE NOT EXISTS (SELECT 1 FROM cleared_tasks c WHERE c.task_id=t.id) GROUP BY status''')}
 
     def claim_next(self):
         with self.lock, self.connection:
@@ -312,7 +366,7 @@ class QueueStore:
         """CSV is a readable projection; SQLite remains the recovery authority."""
         with self.lock:
             batch = self.connection.execute('SELECT output_dir FROM batches WHERE id=?', (batch_id,)).fetchone()
-            rows = [r for r in self.tasks() if r['batch_id'] == batch_id]
+            rows = self.tasks(batch_id)
             attempts = [dict(r) for r in self.connection.execute('SELECT a.*,t.kind,t.sheet,t.row_number FROM attempts a JOIN tasks t ON a.task_id=t.id WHERE t.batch_id=? ORDER BY a.started,a.task_id,a.number', (batch_id,))]
         latest = [['任务ID', '参数表', '工作表', '行号', '类型', '文件名称', '国库选择', '起始日期', '终止日期', '展示范围', '辖属标志', '状态', '尝试次数', '阶段', '错误', '保存路径']]
         for row in rows:

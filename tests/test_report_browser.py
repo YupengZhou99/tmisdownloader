@@ -13,7 +13,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import pandas as pd
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Download
 from test_report_core import APP, ROOT, PLAN
 from tmis_runtime import normalize_task_row
 from tmis_queue import QueueStore
@@ -133,6 +133,12 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await session.page.evaluate("sessionStorage.getItem('session')"), 'RAM_SESSION')
             self.assertEqual(await session.page.evaluate("localStorage.getItem('session')"), 'RAM_LOCAL')
             self.assertTrue(any(c['value'] == 'RAM_COOKIE' for c in await session.context.cookies()))
+            for _ in range(3):
+                prior = session.browser
+                await session.switch_mode(session.headless, force=True)
+                self.assertIsNot(session.browser, prior)
+                self.assertFalse(prior.is_connected())
+                self.assertEqual(await session.page.evaluate("sessionStorage.getItem('session')"), 'RAM_SESSION')
             await session.set_window('minimize')
             await session.set_window('restore')
             await session.switch_mode(True)
@@ -152,6 +158,27 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                     store.close()
         finally:
             await session.close()
+
+    async def test_delayed_dropdown_is_not_misreported_as_missing_option(self):
+        await self.app._navigate_sidebar_smart(self.page, '库存')
+        await self.page.evaluate("""() => {
+            const field = document.querySelector('label[for="pRptDbType"]').parentNode;
+            const input = field.querySelector('input'), menu = field.querySelector('ul');
+            input.value = '0 -- 预处理库';
+            input.onclick = () => setTimeout(() => { menu.style.display = 'block'; }, 1100);
+        }""")
+        await self.app._fill_dropdown(self.page, 'pRptDbType', '1 -- 报表库')
+        self.assertEqual(await self.page.locator('.el-form-item:has(label[for="pRptDbType"]) input').input_value(), '1 -- 报表库')
+
+    async def test_unopened_dropdown_is_an_interaction_error_not_missing_parameter(self):
+        from tmis_runtime import FormInteractionError
+        await self.app._navigate_sidebar_smart(self.page, '库存')
+        await self.page.evaluate("""() => {
+            const input = document.querySelector('label[for="pRptDbType"]').parentNode.querySelector('input');
+            input.value = '0 -- 预处理库'; input.onclick = () => {};
+        }""")
+        with self.assertRaisesRegex(FormInteractionError, '未正常展开'):
+            await self.app._fill_dropdown(self.page, 'pRptDbType', '1 -- 报表库')
 
     async def test_old_enabled_export_does_not_satisfy_a_new_query(self):
         frame = self.page.frame(name="fineReportTsasRpt6040")
@@ -179,6 +206,23 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
                 await self.app._export_and_save(self.page, directory, 'existing', '库存', False)
             self.assertEqual(original.read_bytes(), b'earlier-user-report')
             self.assertFalse(list(Path(directory).glob('*.part')))
+
+    async def test_export_deletes_browser_temporary_copy_after_durable_save(self):
+        saved_stages, removed = [], []
+        original_delete = Download.delete
+        async def delete(download):
+            internal = await download.path()
+            self.assertTrue(saved_stages and Path(saved_stages[0]).is_file())
+            await original_delete(download)
+            removed.append(internal)
+            self.assertFalse(Path(internal).exists())
+        with tempfile.TemporaryDirectory() as directory, patch.object(Download, 'delete', delete):
+            result = await self.app._export_and_save(self.page, directory, 'kept', '库存', False,
+                                                     on_saved=saved_stages.append)
+            self.assertEqual(saved_stages, [result])
+            self.assertEqual(len(removed), 1)
+            self.assertFalse(Path(removed[0]).exists())
+            self.assertGreater(Path(result).stat().st_size, 0)
 
     async def test_income_and_expense_city_province_fields_and_exports(self):
         with tempfile.TemporaryDirectory() as directory:

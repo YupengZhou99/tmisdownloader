@@ -70,21 +70,27 @@ async function run() {
     server.stderr.on('data', data => process.stderr.write(data)); server.once('exit', code => reject(new Error('fixture exit ' + code)));
   });
   await launch();
-  await main.getByRole('button', { name: '批量登录与确认', exact: true }).click();
+  await main.getByRole('button', { name: '管理登录', exact: true }).click();
   await main.getByPlaceholder('每行一个完整登录 URL，分配后可分别核对').fill(config.sources.map(s => s.url).join('\n'));
   await main.getByRole('button', { name: '分配到工作区', exact: true }).click();
   const created = await until(s => s.workspaces.length === 4);
   const ws = created.workspaces;
   if (process.env.TMIS_TEST_BROWSER_PATH) for (const w of ws) await main.evaluate(({ id, browserPath }) => window.tmis.workspaces('update', { id, settings: { browserPath } }), { id: w.id, browserPath: process.env.TMIS_TEST_BROWSER_PATH });
-  await assert.rejects(() => call(ws[0].id, 'start'), /确认/);
-  assert.equal(await main.getByRole('button', { name: '确认并配置任务' }).isEnabled(), false);
+  await assert.rejects(() => call(ws[0].id, 'start'), /登录/);
+  assert.equal(await main.getByRole('button', { name: '进入已登录工作区' }).isEnabled(), false);
+  await main.locator('[data-workspace-id="' + ws[0].id + '"]').getByRole('button', { name: '单独登录', exact: true }).click();
+  await until(s => s.workspaces[0].confirmed);
+  await call(ws[0].id, 'start');
+  assert.ok((await snapshot()).workspaces.slice(1).every(w => !w.confirmed));
+  await main.getByRole('combobox', { name: '登录模式 ' + ws[3].name, exact: true }).selectOption('headless');
   await main.getByRole('button', { name: '全部登录', exact: true }).click();
   await until(s => s.workspaces.every(w => w.state.session_ready));
   await main.screenshot({ path: path.join(artifacts, 'workspaces-login-confirm.png'), animations: 'disabled' });
-  assert.ok((await snapshot()).workspaces.every(w => !w.confirmed && w.state.tasks.length === 0));
-  await main.getByRole('button', { name: '确认并配置任务', exact: true }).click();
+  assert.ok((await snapshot()).workspaces.every(w => w.confirmed && w.state.tasks.length === 0));
+  assert.equal((await snapshot()).workspaces[3].state.headless, true);
+  await main.getByRole('button', { name: '进入已登录工作区', exact: true }).click();
   await until(s => s.workspaces.every(w => w.confirmed));
-  process.stdout.write('PASS four same-origin logins and explicit all-login gate\n');
+  process.stdout.write('PASS independent login/start, headless login and four same-origin sessions\n');
   for (let i = 0; i < 4; i++) await importUI(ws[i], config.sources[i].source, config.directory);
   const staged = await snapshot();
   assert.ok(staged.workspaces.every(w => w.state.tasks.length === 3 && w.state.mode === 'idle'));
@@ -128,11 +134,11 @@ async function run() {
   process.stdout.write('PASS failure and worker-crash isolation, scoped pause/mode and running append\n');
   await main.getByRole('button', { name: '开始本队列', exact: true }).click();
   await overview();
-  await main.getByRole('button', { name: '批量登录与确认', exact: true }).click();
+  await main.getByRole('button', { name: '管理登录', exact: true }).click();
   await main.getByRole('textbox', { name: '登录链接 ' + ws[2].name, exact: true }).fill(config.sources[2].url);
   await main.getByRole('button', { name: '全部登录', exact: true }).click();
   await until(s => s.workspaces[2].state.session_ready);
-  await main.getByRole('button', { name: '确认并配置任务', exact: true }).click();
+  await main.getByRole('button', { name: '进入已登录工作区', exact: true }).click();
   const recovered = await until(s => s.workspaces[2].confirmed);
   assert.equal(recovered.workspaces[2].state.tasks.length, 3);
   assert.equal(recovered.workspaces[2].state.counts.interrupted, 1);
@@ -152,18 +158,38 @@ async function run() {
   }
   await overview(); await main.screenshot({ path: path.join(artifacts, 'workspaces-completed.png'), animations: 'disabled' });
   const identity = finished.workspaces.map(w => ({ id: w.id, root: w.root, tasks: w.state.tasks.map(t => [t.id, t.status, t.attempt_count]) }));
+  await importUI(ws[0], config.sources[0].append, config.directory);
+  assert.equal((await snapshot()).workspaces[0].state.counts.pending, 1);
   await close();
   await launch();
   const restored = await until(s => s.workspaces.length === 4 && s.workspaces.every((w, i) => w.state.counts.succeeded === (i === 3 ? 4 : 3)));
-  assert.deepEqual(restored.workspaces.map(w => ({ id: w.id, root: w.root, tasks: w.state.tasks.map(t => [t.id, t.status, t.attempt_count]) })), identity);
+  assert.deepEqual(restored.workspaces.map(w => ({ id: w.id, root: w.root, tasks: w.state.tasks.filter(t => t.status === 'succeeded').map(t => [t.id, t.status, t.attempt_count]) })), identity);
   assert.ok(restored.workspaces.every(w => !w.confirmed && !w.state.session_ready));
+  await main.getByRole('button', { name: '管理登录', exact: true }).click();
+  await main.getByRole('textbox', { name: '登录链接 ' + ws[0].name, exact: true }).fill(config.sources[0].url);
+  await main.getByRole('combobox', { name: '登录模式 ' + ws[0].name, exact: true }).selectOption('headless');
+  await main.locator('[data-workspace-id="' + ws[0].id + '"]').getByRole('button', { name: '单独登录', exact: true }).click();
+  await until(s => s.workspaces[0].confirmed);
+  await main.getByRole('button', { name: '进入已登录工作区', exact: true }).click();
+  await select(ws[0]);
+  await main.getByRole('button', { name: '开始本队列', exact: true }).click();
+  const independentlyResumed = await until(s => s.workspaces[0].state.counts.succeeded === 4 && s.workspaces[0].state.mode === 'idle');
+  assert.ok(independentlyResumed.workspaces.slice(1).every(w => !w.confirmed && !w.state.session_ready));
+  main.once('dialog', dialog => dialog.accept());
+  await main.getByRole('button', { name: '清空已完成', exact: true }).click();
+  await until(s => (s.workspaces[0].state.counts.succeeded || 0) === 0);
+  assert.ok(independentlyResumed.workspaces[0].state.tasks.every(t => fs.existsSync(t.saved_path)));
+  const retained = await call(ws[0].id, 'details', { id: independentlyResumed.workspaces[0].state.tasks[0].id });
+  assert.ok(retained.history.some(h => h.status === 'succeeded'));
+  process.stdout.write('PASS restart with only one login resumes its queue; completed clearing preserves files and history\n');
   await close();
   for (const entry of fs.readdirSync(path.join(temporary, 'state'), { recursive: true, withFileTypes: true })) {
     if (entry.isFile()) assert.ok(!fs.readFileSync(path.join(entry.parentPath || entry.path, entry.name)).includes(Buffer.from('WORKSPACE_SECRET_')), 'no login tokens in saved state');
   }
   assert.deepEqual(errors, []);
-  const report = { status: 'ok', version: '6.1.0', platform: process.platform, arch: process.arch, packaged: !!packaged,
-    workspaces: 4, downloads: 13, same_origin_cookie_isolation: true, explicit_login_confirmation: true,
+  const report = { status: 'ok', version: '6.2.0', platform: process.platform, arch: process.arch, packaged: !!packaged,
+    workspaces: 4, downloads: 14, same_origin_cookie_isolation: true, independent_login_confirmation: true,
+    single_relogin_resume: true, headless_login: true, completed_clear_preserves_files: true,
     independent_paths: true, four_simultaneous_tasks: true, scoped_pause_and_mode: true,
     worker_crash_isolation: true, running_append: true, failure_retry: true, restart_preserves_all_queues: true, credentials_not_persisted: true };
   fs.writeFileSync(path.join(artifacts, 'workspaces-smoke.json'), JSON.stringify(report, null, 2));

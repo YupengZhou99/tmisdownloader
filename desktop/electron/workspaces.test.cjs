@@ -16,6 +16,8 @@ class FakeBridge extends EventEmitter {
   async call(command, data = {}) {
     this.calls.push({ command, data });
     if (command === 'snapshot') return structuredClone(this.state);
+    if (command === 'has_fingerprints') return this.state.batches.some(b => data.fingerprints.includes(b.fingerprint));
+    if (command === 'fingerprints') return this.state.batches.map(b => b.fingerprint);
     if (command === 'login') { if (this.gate) await this.gate; this.state.session_ready = !data.url.includes('invalid'); return; }
     if (command === 'start') this.state.mode = 'running';
     if (command === 'pause') this.state.mode = 'paused';
@@ -58,11 +60,14 @@ test('four workspaces have isolated state paths and a fifth is rejected', async 
   assert.ok(created.slice(1).every(c => c.statePath.startsWith(path.join(directory, 'workspaces')) && !c.legacy));
   assert.deepEqual(manager.active().map(e => e.meta.id), ids);
 });
-test('no queue config until every pending login is successful and explicitly confirmed', async t => {
+test('one successful login unlocks only that queue without waiting for other workspaces', async t => {
   const { manager } = fixture(t), ids = ['default', manager.create('收入')];
   await manager.login('default', { url: 'https://fixture.test/ok' });
-  await assert.rejects(() => manager.call('default', 'preview', { paths: ['A'] }), /确认/);
-  await assert.rejects(() => manager.confirm(['default']), /全部/);
+  assert.equal((await manager.call('default', 'preview', { paths: ['A'] })).length, 1);
+  await manager.confirm(['default']);
+  await manager.call('default', 'start');
+  assert.equal(manager.get('default').state.mode, 'running');
+  await assert.rejects(() => manager.call(ids[1], 'start'), /登录此/);
   await assert.rejects(() => manager.confirm(ids), /登录成功/);
   await manager.login(ids[1], { url: 'https://fixture.test/ok' });
   await manager.confirm(ids);
@@ -70,6 +75,16 @@ test('no queue config until every pending login is successful and explicitly con
   const added = manager.create('新增');
   assert.ok(manager.get('default').confirmed); assert.equal(manager.get(added).confirmed, false);
   assert.equal((await manager.call('default', 'preview', { paths: ['A'] })).length, 1);
+});
+test('headless login preference is persisted without URLs; log events do not broadcast full snapshots', async t => {
+  const { manager, created, directory } = fixture(t);
+  await manager.login('default', { url: 'https://fixture.test/?token=PRIVATE', headless: true });
+  assert.equal(created[0].b.calls.find(c => c.command === 'login').data.headless, true);
+  const saved = fs.readFileSync(path.join(directory, 'workspaces.json'), 'utf8');
+  assert.ok(saved.includes('"headless": true')); assert.ok(!saved.includes('PRIVATE'));
+  let changes = 0; manager.on('change', () => changes++);
+  for (let i = 0; i < 1000; i++) created[0].b.emit('event', { event: 'log', text: 'bounded', level: 'INFO' });
+  assert.equal(changes, 0); assert.equal(manager.get('default').logs.length, 300);
 });
 test('login calls run concurrently and preserve per-workspace labels without credentials', async t => {
   const { manager, created, directory } = fixture(t), ids = ['default', manager.create('二号')];
@@ -92,6 +107,14 @@ test('commands and events remain tagged; a worker crash cannot mark another offl
   await assert.rejects(() => manager.call(id, 'pause'), /后台已停止/);
   await manager.call('default', 'pause');
   assert.equal(manager.get('default').state.mode, 'paused');
+});
+test('worker exit preserves aggregate counts beyond the first page', async t => {
+  const { manager, created } = fixture(t);
+  await manager.initialize();
+  manager.get('default').state.counts = { succeeded: 180, pending: 200, running: 1 };
+  manager.get('default').state.tasks = [{ id: 'first-page', status: 'succeeded' }];
+  created[0].b.exit();
+  assert.deepEqual(manager.get('default').state.counts, { succeeded: 180, pending: 200, interrupted: 1 });
 });
 test('imports cannot use another workspace preview; scoped output roots never cross', async t => {
   const { manager, directory } = fixture(t), id = manager.create('二号');

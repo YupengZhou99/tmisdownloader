@@ -3,6 +3,7 @@ from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -64,7 +65,7 @@ class WorkspaceFixture(FixtureHandler):
                     self.server.queries.append(entry); self.server.active += 1
                     self.server.max_overlap = max(self.server.max_overlap, self.server.active)
                 try:
-                    time.sleep(2)
+                    time.sleep(float(os.environ.get('TMIS_FIXTURE_DELAY', '2')))
                 finally:
                     with self.server.guard:
                         self.server.active -= 1
@@ -73,6 +74,11 @@ class WorkspaceFixture(FixtureHandler):
             content = ("<meta charset='utf-8'><p id='result'>Report " + rid + "</p>"
                        + "<a class='fr-btn ui-state-disabled' widgetname='ExcelO' href='/download?rid=" + rid + "' download='report.xlsx'>原样导出</a>"
                        + "<script>setTimeout(()=>document.querySelector('a').className='fr-btn ui-state-enabled',100)</script>").encode()
+            if os.environ.get('TMIS_FIXTURE_LARGE') == '1':
+                content += b'''<script>const canvas=document.createElement('canvas');canvas.width=4096;canvas.height=2048;
+                  canvas.style.cssText='position:fixed;pointer-events:none;opacity:0.01';document.body.append(canvas);
+                  canvas.getContext('2d').fillRect(0,0,4096,2048);
+                  const table=document.createElement('table');table.innerHTML=Array.from({length:1000},(_,i)=>'<tr><td>synthetic</td><td>'+i+'</td></tr>').join('');document.body.append(table);</script>'''
             self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(content); return
         if route == '/download':
             with self.server.guard:
@@ -89,7 +95,7 @@ if __name__ == '__main__':
     sources = []
     for slot, kind, treasury, start, end in SPECS:
         source = directory / (slot + '.xlsx'); rows = []
-        for n in range(3):
+        for n in range(int(os.environ.get('TMIS_FIXTURE_TASKS', '3'))):
             row = dict(APP.REPORT_CONFIGS[kind]['sample'])
             row.update({'文件名称': slot + '_任务_' + str(n + 1), '是否追加日期': '0', '保留原文件名': '0', '报表类型': '1 -- 日',
                         '起始日期': start, '终止日期': end, '国库选择': treasury, '展示范围': '0 -- 全部'})
