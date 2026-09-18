@@ -65,9 +65,13 @@ export TMIS_PYTHON="$(command -v python)"
 export TMIS_PLAYWRIGHT_NODE="$(python -c 'import pathlib,playwright;print(pathlib.Path(playwright.__file__).parent / "driver/package")')"
 export TMIS_DESKTOP_EXECUTABLE="$PWD/$task_bundle/tmis-workbench"
 # Only the synthetic root-container test uses this; the launcher keeps sandboxing.
-TMIS_CI_ROOT=1 xvfb-run -a node desktop/scripts/smoke.cjs
-TMIS_CI_ROOT=1 xvfb-run -a node desktop/scripts/workspaces-smoke.cjs
-TMIS_CI_ROOT=1 TMIS_SOAK_SECONDS=14400 TMIS_SOAK_DOWNLOADS=1000 xvfb-run -a node desktop/scripts/stability-soak.cjs
+printf '\nPHASE: packaged UI and renderer recovery smoke\n'
+TMIS_CI_ROOT=1 timeout --kill-after=30s 15m xvfb-run -a node desktop/scripts/smoke.cjs
+printf '\nPHASE: packaged four-workspace regression\n'
+TMIS_CI_ROOT=1 timeout --kill-after=30s 15m xvfb-run -a node desktop/scripts/workspaces-smoke.cjs
+printf '\nPHASE: packaged endurance gate (4 workspaces, >=14400 seconds AND >=1000 exports)\n'
+TMIS_CI_ROOT=1 TMIS_SOAK_SECONDS=14400 TMIS_SOAK_DOWNLOADS=1000 timeout --kill-after=30s 270m xvfb-run -a node desktop/scripts/stability-soak.cjs
+printf '\nPHASE: all gates passed; assemble release\n'
 cp output/playwright/desktop-smoke.json "$task_bundle/acceptance.json"
 cp output/playwright/workspaces-smoke.json "$task_bundle/workspaces-acceptance.json"
 cp output/playwright/stability-soak.json "$task_bundle/stability-acceptance.json"

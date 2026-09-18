@@ -6,6 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn, spawnSync } = require('node:child_process');
 const { createInterface } = require('node:readline');
+const { withDeadline, captureProcessOutput, collectDiagnostics, closeApplication } = require('./acceptance-harness.cjs');
 const root = path.resolve(__dirname, '../..');
 const python = process.env.TMIS_PYTHON || path.join(root, '.venv/bin/python');
 const { _electron } = require(process.env.TMIS_PLAYWRIGHT_NODE || path.join(root, '.venv/lib/python3.9/site-packages/playwright/driver/package'));
@@ -18,8 +19,8 @@ const server = spawn(python, [path.join(root, 'tests/workspace_fixture_server.py
   cwd: root, env: { ...process.env, TMIS_FIXTURE_TASKS: String(perBatch), TMIS_FIXTURE_LARGE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
 let application, main;
 const samples = [], faults = [], sleep = ms => new Promise(r => setTimeout(r, ms));
-async function hub(action, data = {}) { return main.evaluate(({ action, data }) => window.tmis.workspaces(action, data), { action, data }); }
-async function call(id, command, data = {}) { return main.evaluate(({ id, command, data }) => window.tmis.call(command, data, id), { id, command, data }); }
+async function hub(action, data = {}) { return withDeadline(main.evaluate(({ action, data }) => window.tmis.workspaces(action, data), { action, data }), action === 'snapshot' ? 15000 : 150000, 'soak workspaces ' + action); }
+async function call(id, command, data = {}) { return withDeadline(main.evaluate(({ id, command, data }) => window.tmis.call(command, data, id), { id, command, data }), 90000, 'soak ' + command); }
 async function importBatch(w, file, directory) {
   await application.evaluate(({ dialog }, file) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] }); }, file);
   const paths = await main.evaluate(id => window.tmis.files(id), w.id);
@@ -42,6 +43,8 @@ async function run() {
   application = await _electron.launch({ executablePath: packaged || process.env.TMIS_ELECTRON_PATH || require('electron'), args, timeout: 60000,
     env: { ...process.env, TMIS_STATE_DIR: path.join(temporary, 'state'), TMIS_DESKTOP_DATA_DIR: path.join(temporary, 'desktop'),
       TMIS_RUNTIME_DIR: path.join(temporary, 'runtime'), TMIS_PYTHON: python } });
+  captureProcessOutput(application, artifacts, 'stability-soak');
+  application.context().setDefaultTimeout(30000);
   await application.firstWindow();
   for (let i=0; i<200; i++) {
     main = application.windows().find(p => p.url().includes('index.html') && !p.url().includes('view=compact'));
@@ -70,9 +73,9 @@ async function run() {
     const elapsed = Date.now() - started;
     if (done > lastDone) { lastProgress = Date.now(); lastDone = done; }
     assert.ok(Date.now() - lastProgress < 600000, 'no download progress for ten minutes');
-    const sample = await application.evaluate(({ app }) => ({
+    const sample = await withDeadline(application.evaluate(({ app }) => ({
       electron: app.getAppMetrics().reduce((n,p)=>n+(p.memory?.workingSetSize || 0)*1024,0)
-    }));
+    })), 15000, 'soak memory sample');
     sample.shm = null;
     try { const s=fs.statfsSync('/dev/shm'); sample.shm=(s.blocks-s.bfree)*s.bsize; } catch {}
     sample.elapsed = elapsed; sample.done = done;
@@ -81,6 +84,7 @@ async function run() {
     if (elapsed - lastReport > 60000) {
       lastReport = elapsed;
       console.log(JSON.stringify({ minutes: Math.floor(elapsed / 60000), downloads: done, ...sample, elapsed: undefined }));
+      fs.writeFileSync(path.join(artifacts, 'stability-soak-progress.json'), JSON.stringify({ status: 'running', elapsed_seconds: elapsed / 1000, downloads: done, samples }));
     }
     if (elapsed >= duration && done >= minimum) break;
     for (let i=0; i<4; i++) if (!state.workspaces[i].state.counts.pending && !state.workspaces[i].state.current) {
@@ -124,11 +128,14 @@ async function run() {
   fs.writeFileSync(path.join(artifacts, 'stability-soak.json'), JSON.stringify(result, null, 2));
   console.log(JSON.stringify({ ...result, samples: undefined }));
 }
-run().catch(error=>{ console.error(error); process.exitCode=1; }).finally(async()=>{
+withDeadline(run(), duration + 20 * 60000, 'endurance phase').catch(error=>{
+  console.error(error); process.exitCode=1;
+  fs.writeFileSync(path.join(artifacts, 'stability-soak-failure.json'), JSON.stringify({ status: 'failed', error: error.stack, last_sample: samples.at(-1) }, null, 2));
+}).finally(async()=>{
   fs.writeFileSync(path.join(artifacts, 'stability-soak-samples.json'), JSON.stringify(samples));
   if (application) {
-    await application.evaluate(({ dialog })=>{ dialog.showMessageBox=async()=>({ response:2 }); }).catch(()=>{});
-    await application.close().catch(()=>{});
+    await closeApplication(application).catch(error=>{ console.error(error); process.exitCode=1; });
   }
+  collectDiagnostics(temporary, artifacts, 'stability-soak');
   server.kill('SIGTERM');
 });

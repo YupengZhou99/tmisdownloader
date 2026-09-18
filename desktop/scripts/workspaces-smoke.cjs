@@ -5,6 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn, spawnSync } = require('node:child_process');
 const { createInterface } = require('node:readline');
+const { withDeadline, captureProcessOutput, collectDiagnostics, closeApplication } = require('./acceptance-harness.cjs');
 const root = path.resolve(__dirname, '../..');
 const python = process.env.TMIS_PYTHON || path.join(root, '.venv/bin/python');
 const { _electron } = require(process.env.TMIS_PLAYWRIGHT_NODE || path.join(root, '.venv/lib/python3.9/site-packages/playwright/driver/package'));
@@ -20,6 +21,8 @@ async function launch() {
   if (process.env.TMIS_CI_ROOT === '1') args.push('--no-sandbox');
   application = await _electron.launch({ executablePath: packaged || process.env.TMIS_ELECTRON_PATH || require('electron'), args, timeout: 60000,
     env: { ...process.env, TMIS_STATE_DIR: path.join(temporary, 'state'), TMIS_DESKTOP_DATA_DIR: path.join(temporary, 'desktop'), TMIS_PYTHON: python } });
+  captureProcessOutput(application, artifacts, 'workspaces-smoke');
+  application.context().setDefaultTimeout(30000);
   await application.firstWindow();
   for (let i = 0; i < 200; i++) {
     main = application.windows().find(p => p.url().includes('index.html') && !p.url().includes('view=compact'));
@@ -28,14 +31,14 @@ async function launch() {
   assert.ok(main); main.on('pageerror', e => errors.push(e.message));
   await main.getByRole('heading', { name: '每一路，各司其职。', exact: true }).waitFor();
 }
-async function snapshot() { return main.evaluate(() => window.tmis.workspaces('snapshot')); }
+async function snapshot() { return withDeadline(main.evaluate(() => window.tmis.workspaces('snapshot')), 15000, 'workspaces snapshot'); }
 async function until(predicate, timeout = 150000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const s = await snapshot(); if (predicate(s)) return s; await sleep(150); }
   const latest = await snapshot();
   throw new Error('Workspace state timeout: ' + JSON.stringify(latest.workspaces.map(w => ({ name: w.name, mode: w.state.mode, counts: w.state.counts, online: w.online, error: w.error }))));
 }
-async function call(id, command, data = {}) { return main.evaluate(({ id, command, data }) => window.tmis.call(command, data, id), { id, command, data }); }
+async function call(id, command, data = {}) { return withDeadline(main.evaluate(({ id, command, data }) => window.tmis.call(command, data, id), { id, command, data }), 90000, 'workspace ' + command); }
 async function overview() { const button = main.getByRole('button', { name: '所有工作区', exact: true }); if (await button.count()) await button.click(); }
 async function select(w) {
   const selector = main.getByRole('combobox', { name: '切换工作区', exact: true });
@@ -60,8 +63,7 @@ async function importUI(w, file, directory) {
 }
 async function close() {
   if (!application) return;
-  await application.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2 }); });
-  await application.close(); application = null;
+  await closeApplication(application); application = null;
 }
 async function run() {
   const config = await new Promise((resolve, reject) => {
@@ -195,13 +197,14 @@ async function run() {
   fs.writeFileSync(path.join(artifacts, 'workspaces-smoke.json'), JSON.stringify(report, null, 2));
   process.stdout.write(JSON.stringify(report) + '\n');
 }
-run().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
+withDeadline(run(), 14 * 60000, 'workspaces smoke phase').catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (application) {
     if (main) {
-      await main.screenshot({ path: path.join(artifacts, 'workspaces-last-state.png') }).catch(() => {});
-      fs.writeFileSync(path.join(artifacts, 'workspaces-last-state.txt'), await main.locator('body').innerText().catch(() => ''));
+      await withDeadline(main.screenshot({ path: path.join(artifacts, 'workspaces-last-state.png'), timeout: 5000 }), 6000, 'failure screenshot').catch(() => {});
+      fs.writeFileSync(path.join(artifacts, 'workspaces-last-state.txt'), await withDeadline(main.locator('body').innerText({ timeout: 3000 }), 4000, 'failure text').catch(() => 'Renderer unavailable'));
     }
-    await close().catch(() => {});
+    await close().catch(error => { console.error(error); process.exitCode = 1; });
   }
+  collectDiagnostics(temporary, artifacts, 'workspaces-smoke');
   server.kill('SIGTERM');
 });

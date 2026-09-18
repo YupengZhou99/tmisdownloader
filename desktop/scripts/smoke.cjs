@@ -5,6 +5,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { createInterface } = require('node:readline');
+const { withDeadline, captureProcessOutput, collectDiagnostics, closeApplication } = require('./acceptance-harness.cjs');
 const root = path.resolve(__dirname, '../..');
 const playwrightPath = process.env.TMIS_PLAYWRIGHT_NODE || path.join(root, '.venv/lib/python3.9/site-packages/playwright/driver/package');
 const { _electron } = require(playwrightPath);
@@ -17,7 +18,7 @@ let application;
 async function waitForState(page, predicate, timeout = 90000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const result = await page.evaluate(() => window.tmis.call('snapshot', {}, 'default'));
+    const result = await withDeadline(page.evaluate(() => window.tmis.call('snapshot', {}, 'default')), 15000, 'backend snapshot');
     if (predicate(result)) return result;
     await new Promise(resolve => setTimeout(resolve, 150));
   }
@@ -37,6 +38,8 @@ async function run() {
   application = await _electron.launch({ executablePath: packaged || process.env.TMIS_ELECTRON_PATH || require('electron'), args, timeout: 60000,
     env: { ...process.env, TMIS_STATE_DIR: path.join(temporary, 'state'),
       TMIS_DESKTOP_DATA_DIR: path.join(temporary, 'desktop'), TMIS_PYTHON: python } });
+  captureProcessOutput(application, artifacts, 'desktop-smoke');
+  application.context().setDefaultTimeout(30000);
   await application.firstWindow();
   let main;
   for (let attempt = 0; attempt < 200; attempt++) {
@@ -129,24 +132,47 @@ async function run() {
   const details = await main.evaluate(id => window.tmis.call('details', { id }, 'default'), retried.id);
   assert.deepEqual(details.history.map(item => item.status), ['failed', 'succeeded']);
   process.stdout.write('PASS failed-row retry with preserved history\n');
+  process.stdout.write('START renderer crash recovery: prepare completed queue\n');
   await main.getByRole('button', { name: '下载队列', exact: true }).click();
   await main.getByRole('heading', { name: '下载队列', exact: true }).waitFor();
+  // Backend completion alone is insufficient: allow the bounded publisher and
+  // paginated UI to settle, and verify the visible queue really matches it.
+  await main.getByText('6 / 6 已处理', { exact: true }).waitFor({ timeout: 15000 });
+  await main.locator('tbody tr .badge.succeeded').nth(5).waitFor({ timeout: 15000 });
   await main.screenshot({ path: path.join(artifacts, 'workbench-completed.png'), animations: 'disabled' });
-  const workersBefore = await main.evaluate(() => window.tmis.workspaces('snapshot').then(s => s.workspaces.map(w => w.worker_pid)));
-  await application.evaluate(({ BrowserWindow }) => {
+  const workersBefore = await withDeadline(main.evaluate(() => window.tmis.workspaces('snapshot').then(s => s.workspaces.map(w => w.worker_pid))), 5000, 'snapshot before renderer crash');
+  const renderer = await withDeadline(application.evaluate(({ BrowserWindow }) => {
     const win = BrowserWindow.getAllWindows().find(w => !w.webContents.getURL().includes('view=compact'));
-    win.webContents.forcefullyCrashRenderer();
-  });
+    return { pid: win.webContents.getOSProcessId(), mainPid: process.pid };
+  }), 5000, 'locate isolated renderer');
+  assert.ok(Number.isInteger(renderer.pid) && renderer.pid > 1 && renderer.pid !== renderer.mainPid && renderer.pid !== process.pid);
+  assert.ok(!workersBefore.includes(renderer.pid));
+  // Terminate only our renderer from outside the debug protocol. This simulates
+  // an OOM kill without waiting for a crash API reply from the dying process.
+  process.stdout.write('START renderer crash recovery: kill renderer ' + renderer.pid + '\n');
+  process.kill(renderer.pid, 'SIGKILL');
   // The old Playwright Page stays marked crashed. Observe the replacement
   // renderer through Electron rather than reusing that dead test handle.
   let afterCrash;
-  for (let i = 0; i < 100 && !afterCrash; i++) {
+  const recoveryDeadline = Date.now() + 20000;
+  while (Date.now() < recoveryDeadline && !afterCrash) {
     await new Promise(resolve => setTimeout(resolve, 200));
-    afterCrash = await application.evaluate(async ({ BrowserWindow }) => {
+    const probe = await withDeadline(application.evaluate(async ({ BrowserWindow }) => {
       const win = BrowserWindow.getAllWindows().find(w => !w.webContents.getURL().includes('view=compact'));
-      if (win.webContents.isCrashed() || win.webContents.isLoading()) return null;
-      return win.webContents.executeJavaScript("document.body.innerText.includes('每一路，各司其职。') && window.tmis.workspaces('snapshot')").catch(() => null);
-    });
+      const state = { crashed: win.webContents.isCrashed(), loading: win.webContents.isLoading(), pid: win.webContents.getOSProcessId() };
+      if (state.crashed || state.loading) return state;
+      // A page can begin reloading between the state check and this call.
+      let timer;
+      try {
+        state.snapshot = await Promise.race([
+          win.webContents.executeJavaScript("document.body.innerText.includes('每一路，各司其职。') && window.tmis.workspaces('snapshot')").catch(() => null),
+          new Promise(resolve => { timer = setTimeout(() => resolve(null), 1000); })
+        ]);
+      } finally { clearTimeout(timer); }
+      return state;
+    }), Math.min(3000, Math.max(1, recoveryDeadline - Date.now())), 'renderer recovery probe');
+    process.stdout.write('Renderer recovery: ' + JSON.stringify({ ...probe, snapshot: !!probe.snapshot }) + '\n');
+    if (probe.pid > 1 && probe.pid !== renderer.pid) afterCrash = probe.snapshot;
   }
   assert.ok(afterCrash, 'replacement renderer responds within twenty seconds');
   assert.deepEqual(afterCrash.workspaces.map(w => w.worker_pid), workersBefore);
@@ -154,20 +180,14 @@ async function run() {
   assert.equal(afterCrash.workspaces[0].state.session_ready, true);
   process.stdout.write('PASS renderer crash recovery without restarting the queue worker or browser\n');
   assert.deepEqual(pageErrors, []);
-  const report = { status: 'ok', platform: process.platform, arch: process.arch,
-    electron: await application.evaluate(() => process.versions.electron), downloads: 6,
+  const report = { status: 'ok', version: '6.2.0', platform: process.platform, arch: process.arch,
+    electron: await withDeadline(application.evaluate(() => process.versions.electron), 5000, 'Electron version'), downloads: 6,
     login_before_parameters: true, floating_during_execution: true, mode_switch_boundary: true,
     persistent_session: true, successful_retry_skipped: true, multi_file_append: true,
     failed_row_retry: true, renderer_crash_recovery: true, packaged: !!packaged, temporary };
   fs.writeFileSync(path.join(artifacts, 'desktop-smoke.json'), JSON.stringify(report, null, 2));
   process.stdout.write(JSON.stringify(report) + '\n');
-  await application.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2 }); });
-  await application.evaluate(({ app }) => app.quit());
-  await new Promise((resolve, reject) => {
-    if (application.process().exitCode !== null) return resolve();
-    const timer = setTimeout(() => reject(new Error('app did not shut down')), 30000);
-    application.process().once('exit', () => { clearTimeout(timer); resolve(); });
-  });
+  await closeApplication(application);
   application = null;
   const files = fs.readdirSync(path.join(temporary, 'state'));
   for (const filename of files) {
@@ -175,14 +195,14 @@ async function run() {
     if (fs.statSync(file).isFile()) assert.ok(!fs.readFileSync(file).includes(Buffer.from('LOCAL_TEST_ONLY')), 'no login token on disk');
   }
 }
-run().catch(error => { console.error(error); process.exitCode = 1; })
+withDeadline(run(), 14 * 60000, 'desktop smoke phase').catch(error => { console.error(error); process.exitCode = 1; })
   .finally(async () => {
     if (application) {
       const page = application.windows().find(p => !p.url().includes('view=compact'));
-      if (page) await page.screenshot({ path: path.join(artifacts, 'last-state.png') }).catch(() => {});
-      if (page) fs.writeFileSync(path.join(artifacts, 'last-state.txt'), await page.locator('body').innerText().catch(() => ''));
-      await application.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 2 }); }).catch(() => {});
-      await application.close().catch(() => {});
+      if (page) await withDeadline(page.screenshot({ path: path.join(artifacts, 'last-state.png'), timeout: 5000 }), 6000, 'failure screenshot').catch(() => {});
+      if (page) fs.writeFileSync(path.join(artifacts, 'last-state.txt'), await withDeadline(page.locator('body').innerText({ timeout: 3000 }), 4000, 'failure text').catch(() => 'Renderer unavailable'));
+      await closeApplication(application).catch(error => { console.error(error); process.exitCode = 1; });
     }
+    collectDiagnostics(temporary, artifacts, 'desktop-smoke');
     server.kill('SIGTERM');
   });

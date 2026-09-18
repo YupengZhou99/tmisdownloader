@@ -90,13 +90,21 @@ function makeWindow(floating) {
     recoveries.push(Date.now());
     publishers.get(win)?.reset();
     clearTimeout(recoveryTimer);
-    recoveryTimer = setTimeout(() => { if (!quitting && !win.isDestroyed()) win.reload(); }, 2000);
+    recoveryTimer = setTimeout(() => {
+      if (!quitting && !win.isDestroyed()) {
+        diagnostic('renderer-reload', { floating, crashed: win.webContents.isCrashed() });
+        win.reload();
+      }
+    }, 2000);
   };
   win.webContents.on('render-process-gone', (_event, details) => recoverUI(details));
   win.on('unresponsive', () => recoverUI({ reason: 'unresponsive' }));
   win.on('responsive', () => { troubledWindows.delete(win); clearTimeout(recoveryTimer); });
   win.on('closed', () => clearTimeout(recoveryTimer));
-  win.webContents.on('did-finish-load', () => { troubledWindows.delete(win); publishers.get(win)?.reset(); void refresh(); });
+  win.webContents.on('did-finish-load', () => {
+    if (troubledWindows.has(win)) diagnostic('renderer-recovered', { floating, pid: win.webContents.getOSProcessId() });
+    troubledWindows.delete(win); publishers.get(win)?.reset(); void refresh();
+  });
   win.on('close', event => {
     if (quitting) return;
     event.preventDefault();
