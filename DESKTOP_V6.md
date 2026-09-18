@@ -4,7 +4,9 @@
 
 ## 下载与启动
 
-在 GitHub Actions 的 **Build TMIS Workbench V6.2 Kylin x64** 成功运行中下载 `TMIS-Workbench-V6.2-Kylin-x64` artifact。解开 artifact ZIP，再解开其中的 `.tar.gz`，完整保留目录结构。在图形桌面的终端运行：
+本次按用户要求为**快速打包版，未进行本次构建的自动化测试或长稳验收**。打包成功不代表实际麒麟/TMIS 内网已验收，包内 `build-status.json` 会明确标记 `packaged_without_tests`。
+
+在 GitHub Actions 的 **Quick package TMIS Workbench V6.2 Kylin x64** 成功运行中下载 `TMIS-Workbench-V6.2-Kylin-x64` artifact。解开 artifact ZIP，再解开其中的 `.tar.gz`，完整保留目录结构。在图形桌面的终端运行：
 
 ```bash
 cd TMIS-Workbench-Kylin-x64
@@ -90,7 +92,7 @@ npm start
 
 `npm run dev` 提供只读外观预览（127.0.0.1:5173）；浏览器预览没有本机文件和任务服务。`TMIS_DEV_URL=http://127.0.0.1:5173 npm start` 可用于桌面开发。生产包不读取该 URL。
 
-验证入口：
+以下是保留的手动验证入口，仅在另行需要时运行；当前快速打包流水线不执行这些命令：
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py' -v
@@ -101,10 +103,10 @@ node desktop/scripts/workspaces-smoke.cjs
 node desktop/scripts/stability-soak.cjs
 ```
 
-桌面验收脚本使用独立临时任务库、合成 localhost TMIS 页面和参数表，验证真实 Electron → IPC → Python → Chromium 下载。四工作区用例使用同一域名和相同 Cookie 名的独立会话，验证四路同时执行、导出文件的国库/日期及会话标识、单路崩溃、暂停、模式切换、追加和重试，以及应用重启后队列保留。单工作区原有回归仍保留。不接触真实 TMIS、用户任务库或业务数据。CI 在 glibc 2.31 环境执行打包后的应用；截图和验收 JSON 是独立 artifact。
+桌面验收脚本使用独立临时任务库、合成 localhost TMIS 页面和参数表，验证真实 Electron → IPC → Python → Chromium 下载。四工作区用例使用同一域名和相同 Cookie 名的独立会话，验证四路同时执行、导出文件的国库/日期及会话标识、单路崩溃、暂停、模式切换、追加和重试，以及应用重启后队列保留。单工作区原有回归仍保留。不接触真实 TMIS、用户任务库或业务数据。这些脚本保留在源码中，当前 CI 不运行，不会把旧验收结果放进新包。
 
-发布流水线使用 256 MiB `/dev/shm` 容器，要求同一发布二进制通过四工作区至少 4 小时、至少 1000 次导出的长稳测试。模拟报表增加大画布和表格负载，记录每 5 秒的资源样本，并检查预热后的增长上限。只有全部通过才上传发布包；实际结果以该次 Actions 日志和包内 `stability-acceptance.json` 为准，不能仅据此说明文档声称测试通过。可用 `TMIS_SOAK_SECONDS` / `TMIS_SOAK_DOWNLOADS` 缩短本地调试，但短测不等于发布验收。
+快速打包流水线只安装依赖、编译前端、打包 Python 后台及浏览器并生成压缩包和 SHA256，不启动下载程序，不执行单元、界面或长稳测试。任务最长 20 分钟，同一分支新构建会取消旧构建，避免重复占用 Actions 时长。原四工作区、至少 4 小时且至少 1000 次导出的长稳门槛已按用户要求退出当前发布流程，不能将本包称为已通过该验收。
 
-界面恢复验收会从测试进程终止本次隔离启动的渲染器，要求 20 秒内出现新的可响应渲染器，并核对后台进程、会话和成功记录未改变。协议调用、退出清理和各测试阶段都有超时；卡住即失败，不计作长稳运行时间。诊断日志和 Electron 输出随测试 artifact 保存，长测每分钟保存进度，便于区分构建、短测、长测和退出故障。
+如果以后另行执行手动长稳脚本，它默认仍为四工作区、至少 4 小时和 1000 次导出；可用 `TMIS_SOAK_SECONDS` / `TMIS_SOAK_DOWNLOADS` 缩短本地调试，但短测不等于长稳验收。当前打包不会自动执行或恢复这些脚本。
 
 **验收边界：** 构建成功、Mac 本机交互或 Debian 兼容环境测试，均不能替代实际麒麟桌面窗口管理器、系统安全策略、TMIS 内网权限和真实报表内容验收。首次使用请先选一个市级和一个省级任务，人工核对导出后再运行完整队列。

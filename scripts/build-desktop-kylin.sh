@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Build and execute the shipped app in Debian 11 / glibc 2.31.
+# Package only in Debian 11 / glibc 2.31; tests disabled by user request.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 cp scripts/debian-bullseye-snapshot.list /etc/apt/sources.list
 apt-get -o Acquire::Retries=3 update
 apt-get install -y --no-install-recommends \
-  tk tcl libtk8.6 libtcl8.6 xvfb xauth fonts-noto-cjk curl xz-utils \
+  tk tcl libtk8.6 libtcl8.6 fonts-noto-cjk curl xz-utils \
   libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 \
   libcups2 libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 \
   libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
@@ -21,21 +21,20 @@ export PATH="$task_node_dir/node-v22.22.2-linux-x64/bin:$PATH"
 python -m pip install --upgrade pip==24.3.1
 python -m pip install -r requirements-linux-x64.txt
 python -m pip check
-python -m playwright install chromium
-python -m unittest discover -s tests -p 'test_*.py' -v
-TMIS_BROWSER_TESTS=1 xvfb-run -a python -m unittest discover -s tests -p 'test_report_browser.py' -v
-TMIS_GUI_TESTS=1 xvfb-run -a python -m unittest discover -s tests -p 'test_report_ui.py' -v
+python -m playwright install chromium --no-shell
 npm --prefix desktop ci --registry=https://registry.npmjs.org --no-audit --no-fund
 node desktop/node_modules/electron/install.js
 test -x desktop/node_modules/electron/dist/electron
 npm --prefix desktop run build
-npm --prefix desktop test
 
 python -m PyInstaller --noconfirm --clean --onedir --noupx \
   --name tmis-worker --collect-all playwright --hidden-import tmis_ui \
   --hidden-import tkinter.simpledialog --hidden-import pyperclip --hidden-import psutil --hidden-import openpyxl \
   --add-data 'TMIS数据批量抓取工具V5.0_副本.py:.' tmis_worker.py
-task_bundle='dist/TMIS-Workbench-Kylin-x64'
+# Fresh staging prevents an older build's acceptance JSON from entering a
+# package-only release. Existing release directories and user files stay intact.
+task_stage="$(mktemp -d "$PWD/dist/tmis-desktop-build.XXXXXX")"
+task_bundle="$task_stage/TMIS-Workbench-Kylin-x64"
 mkdir -p "$task_bundle"
 cp -a desktop/node_modules/electron/dist/. "$task_bundle/"
 mv "$task_bundle/electron" "$task_bundle/tmis-workbench"
@@ -50,6 +49,7 @@ chmod +x "$task_bundle/启动.sh" "$task_bundle/tmis-workbench"
 cp DESKTOP_V6.md "$task_bundle/使用说明.md"
 python -m pip freeze > "$task_bundle/build-dependencies.txt"
 printf 'Git commit: %s\nTarget: Kylin V10 SP1 x64\nBuild: Debian 11 snapshot 20260801T000000Z\n' "${BUILD_COMMIT:-unknown}" > "$task_bundle/build-info.txt"
+printf 'Mode: package only\nTests: skipped by user request; not accepted for long-term stability\n' >> "$task_bundle/build-info.txt"
 getconf GNU_LIBC_VERSION >> "$task_bundle/build-info.txt"
 node --version >> "$task_bundle/build-info.txt"
 node -p 'require("./desktop/node_modules/electron/package.json").version' >> "$task_bundle/build-info.txt"
@@ -61,22 +61,21 @@ if grep -q 'not found' "$task_bundle/system-libraries.txt"; then
   cat "$task_bundle/system-libraries.txt"
   exit 1
 fi
-export TMIS_PYTHON="$(command -v python)"
-export TMIS_PLAYWRIGHT_NODE="$(python -c 'import pathlib,playwright;print(pathlib.Path(playwright.__file__).parent / "driver/package")')"
-export TMIS_DESKTOP_EXECUTABLE="$PWD/$task_bundle/tmis-workbench"
-# Only the synthetic root-container test uses this; the launcher keeps sandboxing.
-printf '\nPHASE: packaged UI and renderer recovery smoke\n'
-TMIS_CI_ROOT=1 timeout --kill-after=30s 15m xvfb-run -a node desktop/scripts/smoke.cjs
-printf '\nPHASE: packaged four-workspace regression\n'
-TMIS_CI_ROOT=1 timeout --kill-after=30s 15m xvfb-run -a node desktop/scripts/workspaces-smoke.cjs
-printf '\nPHASE: packaged endurance gate (4 workspaces, >=14400 seconds AND >=1000 exports)\n'
-TMIS_CI_ROOT=1 TMIS_SOAK_SECONDS=14400 TMIS_SOAK_DOWNLOADS=1000 timeout --kill-after=30s 270m xvfb-run -a node desktop/scripts/stability-soak.cjs
-printf '\nPHASE: all gates passed; assemble release\n'
-cp output/playwright/desktop-smoke.json "$task_bundle/acceptance.json"
-cp output/playwright/workspaces-smoke.json "$task_bundle/workspaces-acceptance.json"
-cp output/playwright/stability-soak.json "$task_bundle/stability-acceptance.json"
+printf '\nPHASE: package only; all acceptance tests skipped by user request\n'
+python - "$task_bundle" <<'PY'
+import json, os, pathlib, sys
+bundle = pathlib.Path(sys.argv[1])
+version = json.loads((bundle / 'resources/app/package.json').read_text())['version']
+status = {
+    'status': 'packaged_without_tests', 'version': version,
+    'source_commit': os.environ.get('BUILD_COMMIT', 'unknown'),
+    'target': 'Kylin V10 SP1 x86_64', 'mode': 'package_only',
+    'tests': 'not_run', 'stability_acceptance': 'not_run',
+    'reason': 'User requested quick packaging without tests to save Actions minutes',
+}
+(bundle / 'build-status.json').write_text(json.dumps(status, indent=2) + '\n')
+PY
 cp DESKTOP_V6.md dist/使用说明.md
-cp output/playwright/workspaces-smoke.json dist/验收结果.json
-cp output/playwright/stability-soak.json dist/长稳验收结果.json
-tar -C dist -czf dist/TMIS-Workbench-V6.2-Kylin-x64.tar.gz TMIS-Workbench-Kylin-x64
+cp "$task_bundle/build-status.json" dist/打包状态.json
+tar -C "$task_stage" -czf dist/TMIS-Workbench-V6.2-Kylin-x64.tar.gz TMIS-Workbench-Kylin-x64
 sha256sum dist/TMIS-Workbench-V6.2-Kylin-x64.tar.gz | sed 's@  dist/@  @' | tee dist/TMIS-Workbench-V6.2-Kylin-x64.tar.gz.sha256

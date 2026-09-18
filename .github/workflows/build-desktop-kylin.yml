@@ -1,4 +1,4 @@
-name: Build TMIS Workbench V6.2 Kylin x64
+name: Quick package TMIS Workbench V6.2 Kylin x64
 on:
   workflow_dispatch:
   push:
@@ -20,13 +20,16 @@ on:
       - '.github/workflows/build-desktop-kylin.yml'
 permissions:
   contents: read
+concurrency:
+  group: tmis-desktop-kylin-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   desktop:
     runs-on: ubuntu-22.04
-    timeout-minutes: 330
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Build and test exact app for four hours on glibc 2.31
+      - name: Package only on glibc 2.31 (tests skipped by request)
         run: >-
           docker run --rm --platform linux/amd64 --shm-size=256m
           -e BUILD_COMMIT="${{ github.sha }}"
@@ -41,15 +44,7 @@ jobs:
             dist/TMIS-Workbench-V6.2-Kylin-x64.tar.gz
             dist/TMIS-Workbench-V6.2-Kylin-x64.tar.gz.sha256
             dist/使用说明.md
-            dist/验收结果.json
-            dist/长稳验收结果.json
+            dist/打包状态.json
           if-no-files-found: error
+          compression-level: 0
           retention-days: 30
-      - name: Upload desktop test screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: TMIS-V6.2-UI-verification
-          path: output/playwright/
-          if-no-files-found: ignore
-          retention-days: 14
